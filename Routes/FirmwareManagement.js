@@ -3,7 +3,9 @@ const fs = require("fs");
 const Router = require("express").Router();
 
 const FirmwareModel = require("../Models/FirmwareTableModel");
-
+const Device = require("../Models/DeviceModel");
+const Project = require("../Models/ProjectModel");
+const ActivityLogger = require("../Services/ActivityLogger");
 
 // File Uploading API
 
@@ -43,6 +45,42 @@ const formatFileSize = (bytes) => {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
 };
 
+// Helper: validate filename format
+const validateFilename = async (filename, esp_id) => {
+  try {
+    // Find the device by esp_id
+    const device = await Device.findOne({ deviceId: esp_id });
+    if (!device) {
+      return { isValid: false, error: "Device not found" };
+    }
+
+    // Find the project for this device
+    const project = await Project.findById(device.project);
+    if (!project) {
+      return { isValid: false, error: "Project not found for this device" };
+    }
+
+    // Generate expected filename
+    const projectName = project.projectName.replace(/\s+/g, '_').toLowerCase();
+    const deviceName = device.name.replace(/\s+/g, '_').toLowerCase();
+    const expectedFilename = `${projectName}_${deviceName}`;
+
+    // Remove extension from uploaded filename
+    const fileBaseName = filename.replace(/\.[^/.]+$/, '');
+
+    if (fileBaseName !== expectedFilename) {
+      return { 
+        isValid: false, 
+        error: `Invalid filename format. Expected: ${expectedFilename}.bin` 
+      };
+    }
+
+    return { isValid: true };
+  } catch (error) {
+    return { isValid: false, error: "Error validating filename" };
+  }
+};
+
 // === UPLOAD API ===
 Router.post("/upload", uploadSingle, async (req, res) => {
   try {
@@ -50,6 +88,16 @@ Router.post("/upload", uploadSingle, async (req, res) => {
 
     if (!req.file) {
       return res.status(400).json({ message: "File is required" });
+    }
+
+    // Validate filename format
+    const filenameValidation = await validateFilename(req.file.originalname, esp_id);
+    if (!filenameValidation.isValid) {
+      // Remove the uploaded file since it's invalid
+      if (req.file.path && fs.existsSync(req.file.path)) {
+        fs.unlinkSync(req.file.path);
+      }
+      return res.status(400).json({ message: filenameValidation.error });
     }
 
     const fileBuffer = fs.readFileSync(req.file.path); // Read after multer saves
@@ -68,12 +116,36 @@ Router.post("/upload", uploadSingle, async (req, res) => {
 
     await newFirmware.save();
 
+    // Log activity for firmware upload
+    try {
+      // For now, we'll use a default user ID since we don't have user context in this route
+      const defaultUserId = '507f1f77bcf86cd799439011'; // Default user ID for system activities
+      await ActivityLogger.logFirmwareUpload(
+        defaultUserId,
+        esp_id,
+        version,
+        req.file.originalname,
+        {
+          description,
+          fileSize: req.file.size,
+          fileName: req.file.filename
+        }
+      );
+    } catch (activityError) {
+      console.error('Error logging activity:', activityError);
+      // Don't fail the main request if activity logging fails
+    }
+
     // Remove temp file after storing in DB
     fs.unlinkSync(req.file.path);
 
     res.status(200).json({ message: "Firmware uploaded and stored in DB" });
   } catch (err) {
     console.error("Upload error:", err);
+    // Clean up uploaded file if it exists
+    if (req.file && req.file.path && fs.existsSync(req.file.path)) {
+      fs.unlinkSync(req.file.path);
+    }
     res.status(500).json({ message: "Upload failed", error: err.message });
   }
 });

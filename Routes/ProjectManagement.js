@@ -1,8 +1,10 @@
 const Router = require('express').Router();
 const Project = require('../Models/ProjectModel');
+const { authenticate, requireAdmin } = require('../Middleware/auth');
+const ActivityLogger = require('../Services/ActivityLogger');
 
 // Create a new project
-Router.post('/', async (req, res) => {
+Router.post('/', authenticate, requireAdmin, async (req, res) => {
   try {
     const { projectName, projectDescription, devices } = req.body;
     // Validate devices are not already assigned
@@ -16,6 +18,24 @@ Router.post('/', async (req, res) => {
     // Create project
     const project = new Project({ projectName, projectDescription, devices });
     await project.save();
+    
+    // Log project creation activity
+    try {
+      await ActivityLogger.logProjectCreated(
+        req.user.id,
+        project._id,
+        projectName,
+        {
+          projectDescription,
+          deviceCount: devices?.length || 0,
+          createdBy: req.user.name
+        }
+      );
+    } catch (activityError) {
+      console.error('Error logging project creation activity:', activityError);
+      // Don't fail the main request if activity logging fails
+    }
+    
     // Assign devices to this project
     if (devices && devices.length > 0) {
       const Device = require('../Models/DeviceModel');
@@ -46,10 +66,16 @@ Router.get('/', require('../Middleware/auth').authenticate, async (req, res) => 
 });
 
 // Get a single project by ID
-Router.get('/:id', async (req, res) => {
+Router.get('/:id', require('../Middleware/auth').authenticate, async (req, res) => {
   try {
     const project = await Project.findById(req.params.id);
     if (!project) return res.status(404).json({ error: 'Project not found' });
+    
+    // Check if user has access to this project
+    if (req.user.role !== 'admin' && (!req.user.projects || !req.user.projects.includes(project._id.toString()))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to view this project.' });
+    }
+    
     res.json(project);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -57,7 +83,7 @@ Router.get('/:id', async (req, res) => {
 });
 
 // Update a project
-Router.put('/:id', async (req, res) => {
+Router.put('/:id', authenticate, requireAdmin, async (req, res) => {
   try {
     const { projectName, projectDescription, devices } = req.body;
     const project = await Project.findById(req.params.id);
@@ -91,6 +117,29 @@ Router.put('/:id', async (req, res) => {
     if (projectName !== undefined) project.projectName = projectName;
     if (projectDescription !== undefined) project.projectDescription = projectDescription;
     await project.save();
+    
+    // Log project update activity
+    try {
+      await ActivityLogger.logProjectUpdated(
+        req.user.id,
+        project._id,
+        projectName || project.projectName,
+        {
+          projectDescription: projectDescription || project.projectDescription,
+          deviceCount: devices?.length || project.devices?.length || 0,
+          updatedBy: req.user.name,
+          changes: {
+            nameChanged: projectName !== undefined,
+            descriptionChanged: projectDescription !== undefined,
+            devicesChanged: devices !== undefined
+          }
+        }
+      );
+    } catch (activityError) {
+      console.error('Error logging project update activity:', activityError);
+      // Don't fail the main request if activity logging fails
+    }
+    
     res.json(project);
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -98,10 +147,29 @@ Router.put('/:id', async (req, res) => {
 });
 
 // Delete a project
-Router.delete('/:id', async (req, res) => {
+Router.delete('/:id', authenticate, requireAdmin, async (req, res) => {
   try {
     const project = await Project.findByIdAndDelete(req.params.id);
     if (!project) return res.status(404).json({ error: 'Project not found' });
+    
+    // Log project deletion activity
+    try {
+      await ActivityLogger.logBulkOperation(
+        req.user.id,
+        'Project Deletion',
+        1,
+        {
+          projectId: project._id,
+          projectName: project.projectName,
+          deviceCount: project.devices?.length || 0,
+          deletedBy: req.user.name
+        }
+      );
+    } catch (activityError) {
+      console.error('Error logging project deletion activity:', activityError);
+      // Don't fail the main request if activity logging fails
+    }
+    
     res.json({ message: 'Project deleted' });
   } catch (err) {
     res.status(500).json({ error: err.message });
