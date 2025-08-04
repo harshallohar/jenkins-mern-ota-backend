@@ -23,6 +23,7 @@ app.use('/ota-updates', require('./Routes/OTAUpdates'));
 app.use('/users', require('./Routes/UserManagement'));
 app.use('/projects', require('./Routes/ProjectManagement'));
 app.use('/recent-activities', require('./Routes/RecentActivities'));
+app.use('/status-management', require('./Routes/StatusManagement'));
 
 app.get('/', (req, res) => {  
     res.send('Welcome to the Firmware Management API');

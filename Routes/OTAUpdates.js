@@ -53,11 +53,9 @@ Router.post('/', async (req, res) => {
     
     // Normalize status
     let normalizedStatus = 'Failed';
-    if (status === 'Programming Successfull' || status === 'Already Updated') {
+    if (status === 'Programming Successfull') {
       normalizedStatus = 'Success';
     }else if (status === 'Programming Unsuccessfull') { //Programming Unsuccessful
-      normalizedStatus = 'Failed';
-    }else{
       normalizedStatus = 'Failed';
     }
     

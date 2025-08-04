@@ -149,8 +149,46 @@ Router.put('/:id', authenticate, requireAdmin, async (req, res) => {
 // Delete a project
 Router.delete('/:id', authenticate, requireAdmin, async (req, res) => {
   try {
-    const project = await Project.findByIdAndDelete(req.params.id);
+    const project = await Project.findById(req.params.id);
     if (!project) return res.status(404).json({ error: 'Project not found' });
+    
+    // Remove project assignment from all devices assigned to this project
+    const Device = require('../Models/DeviceModel');
+    await Device.updateMany(
+      { project: project._id },
+      { project: null, dateAssigned: null }
+    );
+    
+    // Remove project assignment from all users assigned to this project
+    const User = require('../Models/UserModel');
+    await User.updateMany(
+      { projects: project._id },
+      { $pull: { projects: project._id } }
+    );
+    
+    // Handle status management entries that might be affected
+    const StatusManagement = require('../Models/StatusManagementModel');
+    // Find devices that were in this project
+    const projectDevices = await Device.find({ project: project._id }).select('deviceId');
+    const projectDeviceIds = projectDevices.map(d => d.deviceId);
+    
+    // Update status management entries for devices that were in the deleted project
+    // to remove any inherited status references to other devices in the same project
+    await StatusManagement.updateMany(
+      { 
+        deviceId: { $in: projectDeviceIds },
+        isBasedOnOtherDevice: true,
+        baseDeviceId: { $in: projectDeviceIds }
+      },
+      { 
+        isBasedOnOtherDevice: false,
+        baseDeviceId: null,
+        baseDeviceName: null
+      }
+    );
+    
+    // Now delete the project
+    await Project.findByIdAndDelete(req.params.id);
     
     // Log project deletion activity
     try {

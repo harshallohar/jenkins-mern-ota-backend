@@ -74,6 +74,34 @@ Router.delete('/:id', async (req, res) => {
     const deleted = await Device.findByIdAndDelete(req.params.id);
     if (!deleted) return res.status(404).json({ message: 'Device not found' });
     
+    // Remove device from any project's devices array
+    if (deleted.project) {
+      await Project.findByIdAndUpdate(
+        deleted.project,
+        { $pull: { devices: req.params.id } }
+      );
+    }
+    
+    // Handle status management entries that reference this device
+    const StatusManagement = require('../Models/StatusManagementModel');
+    
+    // Delete status management entries for this device
+    await StatusManagement.deleteMany({ deviceId: deleted.deviceId });
+    
+    // Update status management entries that inherit from this device
+    // Convert them to custom statuses since the base device no longer exists
+    await StatusManagement.updateMany(
+      { 
+        baseDeviceId: deleted.deviceId,
+        isBasedOnOtherDevice: true
+      },
+      { 
+        isBasedOnOtherDevice: false,
+        baseDeviceId: null,
+        baseDeviceName: null
+      }
+    );
+    
     // Log activity for device deletion
     try {
       // For now, we'll use a default user ID since we don't have user context in this route
@@ -102,12 +130,37 @@ Router.delete('/:id', async (req, res) => {
 Router.put('/:id/assign-project', authenticate, requireAdmin, async (req, res) => {
   try {
     const { projectId } = req.body;
+    
+    // First, remove device from any existing project's devices array
+    const existingDevice = await Device.findById(req.params.id);
+    if (existingDevice && existingDevice.project) {
+      await Project.findByIdAndUpdate(
+        existingDevice.project,
+        { $pull: { devices: req.params.id } }
+      );
+    }
+    
+    // Update the device with new project assignment
     const device = await Device.findByIdAndUpdate(
       req.params.id,
       { project: projectId, dateAssigned: new Date() },
       { new: true }
     );
     if (!device) return res.status(404).json({ message: 'Device not found' });
+    
+    // Add device to the new project's devices array (or remove from all projects if projectId is null)
+    if (projectId) {
+      await Project.findByIdAndUpdate(
+        projectId,
+        { $addToSet: { devices: req.params.id } }
+      );
+    } else {
+      // If projectId is null, remove device from all projects
+      await Project.updateMany(
+        { devices: req.params.id },
+        { $pull: { devices: req.params.id } }
+      );
+    }
     
     // Log device assignment activity
     try {

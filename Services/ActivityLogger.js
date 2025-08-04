@@ -241,6 +241,21 @@ class ActivityLogger {
     }
   }
 
+  // Generic log activity method for StatusManagement
+  static async logActivity(activityData) {
+    try {
+      const activity = new RecentActivity({
+        ...activityData
+      });
+      
+      await activity.save();
+      return activity;
+    } catch (error) {
+      console.error('Error creating activity:', error);
+      // Don't throw error to avoid breaking main functionality
+    }
+  }
+
   // Batch create activities
   static async createBatchActivities(userId, activitiesData) {
     try {
