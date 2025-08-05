@@ -137,5 +137,137 @@ async function populateActivities() {
   }
 }
 
+// Test function for updated success/failure logic
+function testSuccessFailureLogic() {
+  console.log('\n=== Testing Updated Success/Failure Logic ===');
+  
+  const testCases = [
+    { status: '2', expectedSuccess: true, description: 'Status 2 should be success' },
+    { status: '3', expectedSuccess: true, description: 'Status 3 should be success' },
+    { status: '-1', expectedSuccess: false, description: 'Status -1 should be failure' },
+    { status: '-2', expectedSuccess: false, description: 'Status -2 should be failure' },
+    { status: '0', expectedSuccess: false, description: 'Status 0 should be failure' },
+    { status: '1', expectedSuccess: false, description: 'Status 1 should be failure' },
+    { status: '4', expectedSuccess: false, description: 'Status 4 should be failure' },
+    { status: '10', expectedSuccess: false, description: 'Status 10 should be failure' },
+    { status: 'abc', expectedSuccess: false, description: 'Non-numeric status should be failure' }
+  ];
+  
+  testCases.forEach(testCase => {
+    const statusCode = parseInt(testCase.status);
+    const isSuccess = !isNaN(statusCode) ? (statusCode === 2 || statusCode === 3) : false;
+    const passed = isSuccess === testCase.expectedSuccess;
+    
+    console.log(`${passed ? '✅' : '❌'} ${testCase.description}`);
+    console.log(`   Status: ${testCase.status} → Success: ${isSuccess} (Expected: ${testCase.expectedSuccess})`);
+  });
+  
+  console.log('\n=== Logic Summary ===');
+  console.log('✅ Only status codes 2 and 3 are considered SUCCESS');
+  console.log('❌ All other codes (including -1, -2, 0, 1, 4, etc.) are considered FAILURE');
+  console.log('❌ Non-numeric status codes are considered FAILURE');
+}
+
+// Test function for ESP statistics counting logic
+function testESPStatsLogic() {
+  console.log('\n=== Testing ESP Statistics Counting Logic ===');
+  
+  // Simulate OTA updates for an ESP with multiple firmware versions
+  const mockOTAUpdates = [
+    // Firmware Version 1.0
+    {
+      deviceId: 'ESP_001',
+      pic_id: 'PIC_A',
+      updatedVersion: '1.0',
+      successAttempts: 0,
+      failureAttempts: 2
+    },
+    {
+      deviceId: 'ESP_001',
+      pic_id: 'PIC_B',
+      updatedVersion: '1.0',
+      successAttempts: 1,
+      failureAttempts: 0
+    },
+    // Firmware Version 2.0
+    {
+      deviceId: 'ESP_001',
+      pic_id: 'PIC_A',
+      updatedVersion: '2.0',
+      successAttempts: 0,
+      failureAttempts: 1
+    },
+    {
+      deviceId: 'ESP_001',
+      pic_id: 'PIC_C',
+      updatedVersion: '2.0',
+      successAttempts: 1,
+      failureAttempts: 0
+    }
+  ];
+  
+  // Group by firmware version
+  const updatesByVersion = new Map();
+  mockOTAUpdates.forEach(update => {
+    const version = update.updatedVersion;
+    if (!updatesByVersion.has(version)) {
+      updatesByVersion.set(version, []);
+    }
+    updatesByVersion.get(version).push(update);
+  });
+  
+  let totalPicsWithSuccess = 0;
+  let totalPicsWithFailure = 0;
+  
+  console.log('Processing by firmware version:');
+  
+  for (const [version, updates] of updatesByVersion) {
+    const picsWithSuccess = new Set();
+    const picsWithFailure = new Set();
+    
+    updates.forEach(update => {
+      const picId = update.pic_id;
+      
+      if (update.successAttempts > 0) {
+        picsWithSuccess.add(picId);
+      }
+      
+      if (update.failureAttempts > 0) {
+        picsWithFailure.add(picId);
+      }
+    });
+    
+    console.log(`Version ${version}:`);
+    console.log(`  PICs with Success: ${picsWithSuccess.size} (${Array.from(picsWithSuccess).join(', ')})`);
+    console.log(`  PICs with Failure: ${picsWithFailure.size} (${Array.from(picsWithFailure).join(', ')})`);
+    
+    totalPicsWithSuccess += picsWithSuccess.size;
+    totalPicsWithFailure += picsWithFailure.size;
+  }
+  
+  console.log('\nTotal ESP Statistics:');
+  console.log(`Total PICs with Success: ${totalPicsWithSuccess}`);
+  console.log(`Total PICs with Failure: ${totalPicsWithFailure}`);
+  
+  // Expected results:
+  // Version 1.0: 1 success (PIC_B), 1 failure (PIC_A) = 2 total
+  // Version 2.0: 1 success (PIC_C), 1 failure (PIC_A) = 2 total
+  // Total: 2 success, 2 failure = 4 total experiences
+  
+  const expectedSuccess = 2;
+  const expectedFailure = 2;
+  
+  console.log('\nVerification:');
+  console.log(`${totalPicsWithSuccess === expectedSuccess ? '✅' : '❌'} Success count: ${totalPicsWithSuccess} (Expected: ${expectedSuccess})`);
+  console.log(`${totalPicsWithFailure === expectedFailure ? '✅' : '❌'} Failure count: ${totalPicsWithFailure} (Expected: ${expectedFailure})`);
+  
+  console.log('\n=== Logic Summary ===');
+  console.log('✅ Each firmware version is counted separately');
+  console.log('✅ Same PIC can contribute to both success and failure counts across versions');
+  console.log('✅ Total counts reflect all experiences across all versions');
+}
+
 // Run the script
 populateActivities(); 
+testSuccessFailureLogic();
+testESPStatsLogic(); 

@@ -21,19 +21,24 @@ Router.get('/', require('../Middleware/auth').authenticate, async (req, res) => 
 });
 
 // Add new device
-Router.post('/', async (req, res) => {
+Router.post('/', authenticate, async (req, res) => {
   try {
     const { name, deviceId } = req.body;
     if (!name || !deviceId) return res.status(400).json({ message: 'Name and Device ID are required' });
+    
+    // Check if device with this deviceId already exists
+    const existingDevice = await Device.findOne({ deviceId });
+    if (existingDevice) {
+      return res.status(400).json({ message: 'Device with this ID already exists' });
+    }
+    
     const newDevice = new Device({ name, deviceId });
     await newDevice.save();
     
     // Log activity for device creation
     try {
-      // For now, we'll use a default user ID since we don't have user context in this route
-      const defaultUserId = '507f1f77bcf86cd799439011'; // Default user ID for system activities
       await ActivityLogger.logDeviceAdded(
-        defaultUserId,
+        req.user.id,
         deviceId,
         name,
         {

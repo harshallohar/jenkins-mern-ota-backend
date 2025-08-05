@@ -3,17 +3,20 @@ const RecentActivity = require('../Models/RecentActivityModel');
 class ActivityLogger {
   // Log OTA Update activities
   static async logOTAUpdate(userId, deviceId, status, version, details = {}) {
-    const activityType = status === 'Success' ? 'OTA_UPDATE_SUCCESS' : 'OTA_UPDATE_FAILED';
-    const severity = status === 'Success' ? 'success' : 'error';
-    
+    const statusCode = parseInt(status);
+    const isSuccess = !isNaN(statusCode) ? (statusCode === 2 || statusCode === 3) : status.toLowerCase().includes('success');
+    const activityType = isSuccess ? 'OTA_UPDATE_SUCCESS' : 'OTA_UPDATE_FAILED';
+    const severity = isSuccess ? 'success' : 'error';
+    const statusText = isSuccess ? 'Success' : 'Failed';
     await this.createActivity(userId, {
       activityType,
-      title: `OTA Update ${status}`,
-      description: `Device ${deviceId} ${status.toLowerCase()} update to version ${version}`,
+      title: `OTA Update ${statusText}`,
+      description: `Device ${deviceId} ${statusText.toLowerCase()} update to version ${version} (Status: ${status})`,
       severity,
       details: {
         deviceId,
         status,
+        statusCode: isNaN(statusCode) ? null : statusCode,
         version,
         ...details
       }
