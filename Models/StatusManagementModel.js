@@ -2,7 +2,13 @@ const mongoose = require('mongoose');
 
 const StatusCodeSchema = new mongoose.Schema({
   code: { type: Number, required: true },
-  message: { type: String, required: true }
+  message: { type: String, required: true },
+  color: { type: String, default: '#6B7280' }, // Default gray color
+  badge: { 
+    type: String, 
+    enum: ['success', 'failure', 'other'], 
+    default: 'other' 
+  }
 });
 
 const StatusManagementSchema = new mongoose.Schema({

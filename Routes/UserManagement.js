@@ -167,6 +167,7 @@ Router.post('/login', async (req, res) => {
         email: user.email,
         role: user.role,
         projects: user.projects, // include projects in user object for frontend if needed
+        projectAssignments: user.projectAssignments, // include project assignments with dates
         canAccessFirmware: user.canAccessFirmware, // <-- add this line
         createdAt: user.createdAt
       }
@@ -176,15 +177,62 @@ Router.post('/login', async (req, res) => {
   }
 });
 
+// Logout user
+Router.post('/logout', authenticate, async (req, res) => {
+  try {
+    // Log logout activity
+    try {
+      await ActivityLogger.logLogout(req.user.id, {
+        email: req.user.email,
+        role: req.user.role,
+        logoutTime: new Date()
+      });
+    } catch (activityError) {
+      console.error('Error logging logout activity:', activityError);
+      // Don't fail the logout if activity logging fails
+    }
+    
+    res.status(200).json({ message: 'Logged out successfully' });
+  } catch (err) {
+    res.status(500).json({ message: 'Logout failed', error: err.message });
+  }
+});
+
 // Assign projects to a user (admin only)
 Router.put('/:id/assign-projects', authenticate, requireAdmin, async (req, res) => {
   try {
     const { projectIds } = req.body;
+    
+    // Get current user to check existing assignments
+    const currentUser = await User.findById(req.params.id);
+    if (!currentUser) return res.status(404).json({ message: 'User not found' });
+    
+    // Create project assignments with current date for new projects
+    const existingAssignments = currentUser.projectAssignments || [];
+    const existingProjectIds = existingAssignments.map(pa => pa.projectId.toString());
+    
+    const newAssignments = projectIds
+      .filter(projectId => !existingProjectIds.includes(projectId.toString()))
+      .map(projectId => ({
+        projectId: projectId,
+        assignedAt: new Date()
+      }));
+    
+    // Combine existing and new assignments
+    const updatedAssignments = [
+      ...existingAssignments,
+      ...newAssignments
+    ];
+    
     const user = await User.findByIdAndUpdate(
       req.params.id,
-      { projects: projectIds },
+      { 
+        projects: projectIds,
+        projectAssignments: updatedAssignments
+      },
       { new: true }
     ).select('-password');
+    
     if (!user) return res.status(404).json({ message: 'User not found' });
     
     // Log project assignment activity

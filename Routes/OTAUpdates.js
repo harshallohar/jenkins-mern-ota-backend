@@ -1,568 +1,413 @@
 const Router = require('express').Router();
 const OTAUpdate = require('../Models/OTAUpdateModel');
 const StatusManagement = require('../Models/StatusManagementModel');
-const ActivityLogger = require('../Services/ActivityLogger');
+const Device = require('../Models/DeviceModel');
 const DeviceStatsService = require('../Services/DeviceStatsService');
-const { authenticate } = require('../Middleware/auth');
 
-// Get all OTA updates with status management information
+// Helper: map raw status code to message/badge/color using StatusManagement
+async function resolveStatusForDevice(deviceId, rawStatus) {
+  const statusEntry = await StatusManagement.findOne({ deviceId });
+  let message = String(rawStatus);
+  let badge = 'other';
+  let color = undefined;
+
+  const code = parseInt(rawStatus);
+  
+  // Check if status indicates "already updated" - treat as success
+  if (message.toLowerCase().includes('already updated') || 
+      message.toLowerCase().includes('already up to date') ||
+      message.toLowerCase().includes('no update needed') ||
+      message.toLowerCase().includes('firmware already current') ||
+      message.toLowerCase().includes('version already installed') ||
+      message.toLowerCase().includes('no update required') ||
+      message.toLowerCase().includes('current version running')) {
+    badge = 'success';
+    color = '#16a34a'; // Green color for success
+  }
+  // Check if status indicates "up to date" - treat as success
+  else if (message.toLowerCase().includes('up to date') ||
+           message.toLowerCase().includes('current version')) {
+    badge = 'success';
+    color = '#16a34a'; // Green color for success
+  }
+  // Check if status indicates "successful update" - treat as success
+  else if (message.toLowerCase().includes('success') ||
+           message.toLowerCase().includes('updated successfully') ||
+           message.toLowerCase().includes('update complete') ||
+           message.toLowerCase().includes('update finished') ||
+           message.toLowerCase().includes('installation complete') ||
+           message.toLowerCase().includes('firmware installed') ||
+           message.toLowerCase().includes('update successful')) {
+    badge = 'success';
+    color = '#16a34a'; // Green color for success
+  }
+  // Check if status indicates "update failed" - treat as failure
+  else if (message.toLowerCase().includes('failed') ||
+           message.toLowerCase().includes('error') ||
+           message.toLowerCase().includes('update failed')) {
+    badge = 'failure';
+    color = '#dc2626'; // Red color for failure
+  }
+  // Check if status indicates "in progress" or "pending" - treat as other
+  else if (message.toLowerCase().includes('in progress') ||
+           message.toLowerCase().includes('pending') ||
+           message.toLowerCase().includes('downloading') ||
+           message.toLowerCase().includes('installing')) {
+    badge = 'other';
+    color = '#f59e0b'; // Amber color for in progress
+  }
+  
+  // If we have a numeric status code and StatusManagement configuration, use that
+  if (statusEntry && statusEntry.statusCodes && !isNaN(code)) {
+    const match = statusEntry.statusCodes.find(sc => sc.code === code);
+    if (match) {
+      message = match.message;
+      badge = match.badge || badge; // Use configured badge if available, otherwise keep our logic
+      color = match.color || color; // Use configured color if available, otherwise keep our logic
+    }
+  }
+  
+  // Fallback: if we have a numeric code, use the existing logic (2 or 3 = success)
+  if (!isNaN(code)) {
+    if (code === 2 || code === 3) {
+      badge = 'success';
+      color = '#16a34a';
+    } else if (code === 0 || code === 1) {
+      badge = 'failure';
+      color = '#dc2626';
+    }
+  }
+  
+  return { message, badge, color };
+}
+
+// Ingest report from ESP32
+// POST /ota-updates/
+// Body: { pic_id, deviceId, status, previousVersion, updatedVersion, date? }
+Router.post('/', async (req, res) => {
+  try {
+    const { pic_id, deviceId, status, previousVersion, updatedVersion, date } = req.body || {};
+    if (!pic_id || !deviceId || !status || !previousVersion || !updatedVersion) {
+      return res.status(400).json({ message: 'pic_id, deviceId, status, previousVersion, updatedVersion are required' });
+    }
+
+    const entryDate = date ? new Date(date) : new Date();
+    if (date && isNaN(entryDate.getTime())) {
+      return res.status(400).json({ message: 'Invalid date format' });
+    }
+
+    const { message, badge, color } = await resolveStatusForDevice(deviceId, status);
+
+    // Find existing record for this PIC and target version, else create
+    let record = await OTAUpdate.findOne({ pic_id, updatedVersion });
+    if (!record) {
+      record = new OTAUpdate({
+        pic_id,
+        deviceId,
+        previousVersion,
+        updatedVersion,
+        date: entryDate
+      });
+    }
+
+    // Append status entry with resolved message and badge/color
+    record.addStatusEntry(status, message, entryDate, badge, color);
+    await record.save();
+
+    // Update device-level stats and ESP-level stats
+    try { await DeviceStatsService.updateDeviceStats(deviceId); } catch (_) {}
+    try { await DeviceStatsService.updateESPStats(deviceId); } catch (_) {}
+
+    return res.status(201).json({
+      message: 'OTA update ingested',
+      data: record
+    });
+  } catch (err) {
+    if (err && err.code === 11000) {
+      return res.status(409).json({ message: 'Duplicate PIC/version record' });
+    }
+    return res.status(500).json({ message: 'Error ingesting OTA update', error: err.message });
+  }
+});
+
+// Cards summary for OTAUpdates page (total success/failure/other by attempts)
+Router.get('/cards-summary', async (req, res) => {
+  try {
+    const { deviceId } = req.query;
+    const filter = {};
+    if (deviceId) filter.deviceId = deviceId;
+    const updates = await OTAUpdate.find(filter);
+
+    let success = 0, failure = 0, other = 0, total = 0;
+    updates.forEach(u => {
+      u.statusEntries.forEach(e => {
+        total += 1;
+        if (e.badge === 'success') success += 1;
+        else if (e.badge === 'failure') failure += 1;
+        else other += 1;
+      });
+    });
+
+    return res.json({ success, failure, other, total });
+  } catch (err) {
+    return res.status(500).json({ message: 'Error computing cards summary', error: err.message });
+  }
+});
+
+// Daily unique counts for dashboard with dedup: success overrides failure within same day
+// Query: startDate, endDate, projectId?, deviceId?
+Router.get('/daily-unique-stats', async (req, res) => {
+  try {
+    const { startDate, endDate, projectId, deviceId } = req.query;
+    const start = startDate ? new Date(startDate) : new Date(new Date().toISOString().slice(0,10));
+    const end = endDate ? new Date(endDate) : new Date();
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+      return res.status(400).json({ message: 'Invalid startDate or endDate' });
+    }
+
+    // If projectId is present, restrict allowed deviceIds to devices in that project
+    let allowedDeviceIds = null;
+    if (projectId) {
+      const projectDevices = await Device.find({ project: projectId }, { deviceId: 1 });
+      allowedDeviceIds = new Set(projectDevices.map(d => d.deviceId));
+    }
+
+    // Fetch records that have any statusEntries within the date range.
+    // This ensures older records whose lastUpdated is outside the range are still considered.
+    const findFilter = {
+      statusEntries: { $elemMatch: { date: { $gte: start, $lte: end } } }
+    };
+    if (deviceId) {
+      findFilter.deviceId = deviceId;
+    } else if (allowedDeviceIds) {
+      findFilter.deviceId = { $in: Array.from(allowedDeviceIds) };
+    }
+    const all = await OTAUpdate.find(findFilter);
+
+    // Expand to attempt-level entries carrying their dates and PIC IDs
+    const entries = [];
+    all.forEach(update => {
+      if (allowedDeviceIds && !allowedDeviceIds.has(update.deviceId)) return;
+      update.statusEntries.forEach(entry => {
+        const d = entry.date ? new Date(entry.date) : new Date(update.lastUpdated);
+        if (d >= start && d <= end) {
+          entries.push({
+            deviceId: update.deviceId,
+            pic_id: update.pic_id,
+            updatedVersion: update.updatedVersion,
+            date: d,
+            badge: entry.badge || 'other'
+          });
+        }
+      });
+    });
+
+    // Prepare day buckets
+    const byDay = new Map();
+    entries.forEach(e => {
+      const dayKey = new Date(Date.UTC(e.date.getUTCFullYear(), e.date.getUTCMonth(), e.date.getUTCDate())).toISOString().slice(0,10);
+      if (!byDay.has(dayKey)) byDay.set(dayKey, []);
+      byDay.get(dayKey).push(e);
+    });
+
+    // For each day, count unique successes per (PIC_ID, updatedVersion).
+    // If a PIC has failures/others earlier and later succeeds in the same day (any version),
+    // drop those earlier non-success entries for that day.
+    const daily = [];
+
+    // Iterate through every day in range to include zero-activity days
+    const walkDate = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate()));
+    const endDay = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), end.getUTCDate()));
+    while (walkDate <= endDay) {
+      const dayKey = new Date(Date.UTC(
+        walkDate.getUTCFullYear(),
+        walkDate.getUTCMonth(),
+        walkDate.getUTCDate()
+      )).toISOString().slice(0,10);
+      const list = byDay.get(dayKey) || [];
+
+      // Track last success time per PIC in this day
+      const lastSuccessByPic = new Map(); // pic_id -> Date
+      list.forEach(e => {
+        // Treat "already updated" as success for counting purposes
+        if (e.badge === 'success' || e.badge === 'other') {
+          const prev = lastSuccessByPic.get(e.pic_id);
+          if (!prev || e.date > prev) lastSuccessByPic.set(e.pic_id, e.date);
+        }
+      });
+
+      // Track the last outcome for each (pic_id, updatedVersion) tuple
+      const lastByTuple = new Map(); // key: pic|version -> { badge, date, deviceId }
+      list.forEach(e => {
+        const key = `${e.pic_id}|${e.updatedVersion}`;
+        const prev = lastByTuple.get(key);
+        if (!prev || e.date > prev.date) {
+          lastByTuple.set(key, { badge: e.badge, date: e.date, deviceId: e.deviceId });
+        }
+      });
+
+      let success = 0, failure = 0, total = 0;
+      const successDevices = new Set();
+      const failureDevices = new Set();
+      lastByTuple.forEach((val, key) => {
+        const [picId] = key.split('|');
+        const lastSucc = lastSuccessByPic.get(picId);
+        
+        // If there is a later success for this PIC and this tuple's final outcome
+        // happened before that success and is not success, drop it
+        if (val.badge !== 'success' && val.badge !== 'other' && lastSucc && val.date < lastSucc) {
+          return;
+        }
+        
+        total += 1;
+        // Treat "other" (including "already updated") as success for counting
+        if (val.badge === 'success' || val.badge === 'other') { 
+          success += 1; 
+          successDevices.add(val.deviceId); 
+        }
+        else if (val.badge === 'failure') { 
+          failure += 1; 
+          failureDevices.add(val.deviceId); 
+        }
+      });
+
+      daily.push({ 
+        date: dayKey, 
+        success, 
+        failure, 
+        total,
+        successDevices: Array.from(successDevices),
+        failureDevices: Array.from(failureDevices)
+      });
+
+      // next day
+      walkDate.setUTCDate(walkDate.getUTCDate() + 1);
+    }
+
+    return res.json({ range: { start: start.toISOString(), end: end.toISOString() }, daily });
+  } catch (err) {
+    return res.status(500).json({ message: 'Error computing daily unique stats', error: err.message });
+  }
+});
+
+// List OTA updates (optionally by deviceId)
 Router.get('/', async (req, res) => {
   try {
-    const updates = await OTAUpdate.find().sort({ lastUpdated: -1 });
-    
-    // Fetch status management data for all devices
-    const statusManagementData = await StatusManagement.find();
-    
-    // Enhance updates with status management information
-    const enhancedUpdates = updates.map(update => {
-      const statusEntry = statusManagementData.find(sm => sm.deviceId === update.deviceId);
-      const latestStatus = update.getLatestStatus();
-      let statusMessage = latestStatus ? latestStatus.status : 'No status';
-      
-      if (statusEntry && statusEntry.statusCodes && latestStatus) {
-        // Try to find matching status code
-        const statusCode = parseInt(latestStatus.status);
-        if (!isNaN(statusCode)) {
-          const matchingCode = statusEntry.statusCodes.find(code => code.code === statusCode);
-          if (matchingCode) {
-            statusMessage = matchingCode.message;
-          }
-        }
-      }
-      
-      const summary = update.getStatusSummary();
-      
-      return {
-        ...update.toObject(),
-        status: latestStatus ? latestStatus.status : 'No status',
-        statusMessage,
-        hasStatusManagement: !!statusEntry,
-        summary
-      };
-    });
-    
-    res.status(200).json(enhancedUpdates);
+    const { deviceId } = req.query;
+    const filter = deviceId ? { deviceId } : {};
+    const updates = await OTAUpdate.find(filter).sort({ lastUpdated: -1 });
+    return res.json(updates);
   } catch (err) {
-    res.status(500).json({ message: 'Error fetching OTA updates', error: err.message });
+    return res.status(500).json({ message: 'Error fetching updates', error: err.message });
   }
 });
 
-// Get OTA updates for a specific device with status management
-Router.get('/device/:deviceId', async (req, res) => {
+// Flattened attempts view for terminal-like history (do not apply dashboard dedup rules)
+// GET /ota-updates/attempts?deviceId=&projectId=
+Router.get('/attempts', async (req, res) => {
   try {
-    const { deviceId } = req.params;
-    const updates = await OTAUpdate.find({ deviceId }).sort({ lastUpdated: -1 });
-    
-    // Fetch status management data for this device
-    const statusEntry = await StatusManagement.findOne({ deviceId });
-    
-    // Enhance updates with status management information
-    const enhancedUpdates = updates.map(update => {
-      const latestStatus = update.getLatestStatus();
-      let statusMessage = latestStatus ? latestStatus.status : 'No status';
-      
-      if (statusEntry && statusEntry.statusCodes && latestStatus) {
-        // Try to find matching status code
-        const statusCode = parseInt(latestStatus.status);
-        if (!isNaN(statusCode)) {
-          const matchingCode = statusEntry.statusCodes.find(code => code.code === statusCode);
-          if (matchingCode) {
-            statusMessage = matchingCode.message;
-          }
-        }
-      }
-      
-      const summary = update.getStatusSummary();
-      
-      return {
-        ...update.toObject(),
-        status: latestStatus ? latestStatus.status : 'No status',
-        statusMessage,
-        hasStatusManagement: !!statusEntry,
-        summary
-      };
-    });
-    
-    res.status(200).json(enhancedUpdates);
-  } catch (err) {
-    res.status(500).json({ message: 'Error fetching OTA updates', error: err.message });
-  }
-});
+    const { deviceId, projectId } = req.query;
 
-// Get detailed PIC information for a specific device
-Router.get('/device-pic-details/:deviceId', authenticate, async (req, res) => {
-  try {
-    const { deviceId } = req.params;
-    
-    // Get all OTA updates for this device
-    const otaUpdates = await OTAUpdate.find({ deviceId });
-    
-    if (otaUpdates.length === 0) {
-      return res.status(404).json({ message: 'No OTA updates found for this device' });
+    // Build base filter
+    const baseFilter = deviceId ? { deviceId } : {};
+    const updates = await OTAUpdate.find(baseFilter).sort({ lastUpdated: -1 });
+
+    // Optional project filter needs device lookup
+    let allowedDeviceIds = null;
+    if (projectId) {
+      const projectDevices = await Device.find({ project: projectId }, { deviceId: 1 });
+      allowedDeviceIds = new Set(projectDevices.map(d => d.deviceId));
     }
-    
-    // Group updates by PIC ID
-    const picDetails = new Map();
-    
-    otaUpdates.forEach(update => {
-      const picId = update.pic_id;
-      
-      if (!picDetails.has(picId)) {
-        picDetails.set(picId, {
-          picId,
-          totalAttempts: 0,
-          successAttempts: 0,
-          failureAttempts: 0,
-          firmwareVersions: new Set(),
-          finalStatus: 'unknown',
-          lastUpdated: update.lastUpdated,
-          statusEntries: []
-        });
-      }
-      
-      const picDetail = picDetails.get(picId);
-      picDetail.totalAttempts += update.totalAttempts;
-      picDetail.successAttempts += update.successAttempts;
-      picDetail.failureAttempts += update.failureAttempts;
-      picDetail.firmwareVersions.add(update.updatedVersion);
-      picDetail.statusEntries.push(...update.statusEntries);
-      
-      // Update final status based on latest entry
-      if (update.finalStatus) {
-        picDetail.finalStatus = update.finalStatus;
-      }
-      
-      // Update last updated timestamp
-      if (update.lastUpdated > picDetail.lastUpdated) {
-        picDetail.lastUpdated = update.lastUpdated;
-      }
-    });
-    
-    // Convert to array and format the data
-    const picDetailsArray = Array.from(picDetails.values()).map(pic => ({
-      ...pic,
-      firmwareVersions: Array.from(pic.firmwareVersions),
-      statusEntries: pic.statusEntries.slice(-5) // Show last 5 status entries
-    }));
-    
-    // Sort by PIC ID
-    picDetailsArray.sort((a, b) => a.picId.localeCompare(b.picId));
-    
-    res.status(200).json({
-      deviceId,
-      totalPics: picDetailsArray.length,
-      picDetails: picDetailsArray,
-      summary: {
-        totalAttempts: picDetailsArray.reduce((sum, pic) => sum + pic.totalAttempts, 0),
-        totalSuccessAttempts: picDetailsArray.reduce((sum, pic) => sum + pic.successAttempts, 0),
-        totalFailureAttempts: picDetailsArray.reduce((sum, pic) => sum + pic.failureAttempts, 0),
-        picsWithSuccess: picDetailsArray.filter(pic => pic.successAttempts > 0).length,
-        picsWithFailure: picDetailsArray.filter(pic => pic.failureAttempts > 0).length,
-        picsWithFinalSuccess: picDetailsArray.filter(pic => pic.finalStatus === 'success').length,
-        picsWithFinalFailure: picDetailsArray.filter(pic => pic.finalStatus === 'failed').length
-      }
-    });
-  } catch (error) {
-    console.error('Error getting device PIC details:', error);
-    res.status(500).json({ message: 'Error fetching PIC details', error: error.message });
-  }
-});
 
-// Get consolidated statistics
-Router.get('/statistics', async (req, res) => {
-  try {
-    const updates = await OTAUpdate.find();
-    
-    const statistics = {
-      totalRecords: updates.length,
-      totalAttempts: updates.reduce((sum, update) => sum + update.totalAttempts, 0),
-      totalSuccessAttempts: updates.reduce((sum, update) => sum + update.successAttempts, 0),
-      totalFailureAttempts: updates.reduce((sum, update) => sum + update.failureAttempts, 0),
-      finalSuccessCount: updates.filter(u => u.finalStatus === 'success').length,
-      finalFailureCount: updates.filter(u => u.finalStatus === 'failed').length,
-      pendingCount: updates.filter(u => u.finalStatus === 'pending').length,
-      byFirmwareVersion: {}
-    };
-    
-    // Group by firmware version
+    const attempts = [];
     updates.forEach(update => {
-      const version = update.updatedVersion;
-      if (!statistics.byFirmwareVersion[version]) {
-        statistics.byFirmwareVersion[version] = {
-          totalRecords: 0,
-          totalAttempts: 0,
-          successAttempts: 0,
-          failureAttempts: 0,
-          finalSuccessCount: 0,
-          finalFailureCount: 0,
-          pendingCount: 0
-        };
-      }
-      
-      const versionStats = statistics.byFirmwareVersion[version];
-      versionStats.totalRecords++;
-      versionStats.totalAttempts += update.totalAttempts;
-      versionStats.successAttempts += update.successAttempts;
-      versionStats.failureAttempts += update.failureAttempts;
-      
-      if (update.finalStatus === 'success') versionStats.finalSuccessCount++;
-      else if (update.finalStatus === 'failed') versionStats.finalFailureCount++;
-      else versionStats.pendingCount++;
+      if (allowedDeviceIds && !allowedDeviceIds.has(update.deviceId)) return;
+      (update.statusEntries || []).forEach((entry, idx) => {
+        attempts.push({
+          attemptId: `${update._id}:${entry.attemptNumber || idx + 1}`,
+          recordId: update._id,
+          deviceId: update.deviceId,
+          pic_id: update.pic_id,
+          previousVersion: update.previousVersion,
+          updatedVersion: update.updatedVersion,
+          status: entry.status,
+          statusMessage: entry.statusMessage,
+          badge: entry.badge || 'other',
+          color: entry.color,
+          date: entry.date || update.lastUpdated,
+          attemptNumber: entry.attemptNumber || idx + 1
+        });
+      });
     });
-    
-    res.status(200).json(statistics);
+
+    // Sort newest first by date
+    attempts.sort((a, b) => new Date(b.date) - new Date(a.date));
+
+    return res.json(attempts);
   } catch (err) {
-    res.status(500).json({ message: 'Error fetching statistics', error: err.message });
+    return res.status(500).json({ message: 'Error fetching attempts', error: err.message });
   }
 });
 
-// Get device-level statistics
-Router.get('/device-stats/:deviceId', async (req, res) => {
+// Delete an OTA update by id
+Router.delete('/:id', async (req, res) => {
   try {
-    const { deviceId } = req.params;
-    const stats = await DeviceStatsService.getDeviceStats(deviceId);
-    
-    if (!stats) {
-      return res.status(404).json({ message: 'Device not found or no statistics available' });
-    }
-    
-    res.status(200).json(stats);
+    const { id } = req.params;
+    const deleted = await OTAUpdate.findByIdAndDelete(id);
+    if (!deleted) return res.status(404).json({ message: 'Not found' });
+    return res.json({ message: 'Deleted', id });
   } catch (err) {
-    res.status(500).json({ message: 'Error fetching device statistics', error: err.message });
+    return res.status(500).json({ message: 'Error deleting', error: err.message });
   }
 });
 
-// Get all devices with their statistics
-Router.get('/all-device-stats', async (req, res) => {
-  try {
-    const devices = await DeviceStatsService.getAllDevicesWithStats();
-    res.status(200).json(devices);
-  } catch (err) {
-    res.status(500).json({ message: 'Error fetching all device statistics', error: err.message });
-  }
-});
+module.exports = Router;
+// Additional dashboard stats endpoints for convenience/compatibility
 
-// Get summary statistics across all devices
-Router.get('/summary-stats', async (req, res) => {
-  try {
-    const summary = await DeviceStatsService.getSummaryStats();
-    res.status(200).json(summary);
-  } catch (err) {
-    res.status(500).json({ message: 'Error fetching summary stats', error: err.message });
-  }
-});
-
-// Get device-level statistics for dashboard
-Router.get('/dashboard-device-stats', async (req, res) => {
-  try {
-    const { startDate, endDate, projectId } = req.query;
-    
-    if (!startDate || !endDate) {
-      return res.status(400).json({ message: 'startDate and endDate are required' });
-    }
-    
-    const stats = await DeviceStatsService.getDashboardDeviceStats(
-      new Date(startDate),
-      new Date(endDate),
-      projectId
-    );
-    
-    res.status(200).json(stats);
-  } catch (err) {
-    res.status(500).json({ message: 'Error fetching dashboard device stats', error: err.message });
-  }
-});
-
-// Get daily device statistics for dashboard charts
-Router.get('/daily-device-stats', async (req, res) => {
-  try {
-    const { startDate, endDate, projectId } = req.query;
-    
-    if (!startDate || !endDate) {
-      return res.status(400).json({ message: 'startDate and endDate are required' });
-    }
-    
-    const stats = await DeviceStatsService.getDailyDeviceStats(
-      new Date(startDate),
-      new Date(endDate),
-      projectId
-    );
-    
-    res.status(200).json(stats);
-  } catch (err) {
-    res.status(500).json({ message: 'Error fetching daily device stats', error: err.message });
-  }
-});
-
-// Get weekly device statistics for dashboard charts
-Router.get('/weekly-device-stats', async (req, res) => {
-  try {
-    const { startDate, endDate, projectId } = req.query;
-    
-    if (!startDate || !endDate) {
-      return res.status(400).json({ message: 'startDate and endDate are required' });
-    }
-    
-    const stats = await DeviceStatsService.getWeeklyDeviceStats(
-      new Date(startDate),
-      new Date(endDate),
-      projectId
-    );
-    
-    res.status(200).json(stats);
-  } catch (err) {
-    res.status(500).json({ message: 'Error fetching weekly device stats', error: err.message });
-  }
-});
-
-// Update statistics for all devices
-Router.post('/update-all-stats', async (req, res) => {
-  try {
-    const results = await DeviceStatsService.updateAllDeviceStats();
-    res.status(200).json({ message: 'All device stats updated', results });
-  } catch (err) {
-    res.status(500).json({ message: 'Error updating all device stats', error: err.message });
-  }
-});
-
-// Get ESP-level statistics for a specific device
-Router.get('/esp-stats/:deviceId', async (req, res) => {
-  try {
-    const { deviceId } = req.params;
-    const stats = await DeviceStatsService.getESPStats(deviceId);
-    
-    if (!stats) {
-      return res.status(404).json({ message: 'ESP statistics not found' });
-    }
-    
-    res.status(200).json(stats);
-  } catch (err) {
-    res.status(500).json({ message: 'Error fetching ESP stats', error: err.message });
-  }
-});
-
-// Get all ESPs with their statistics
-Router.get('/all-esp-stats', async (req, res) => {
-  try {
-    const devices = await DeviceStatsService.getAllESPsWithStats();
-    res.status(200).json(devices);
-  } catch (err) {
-    res.status(500).json({ message: 'Error fetching all ESP stats', error: err.message });
-  }
-});
-
-// Update ESP statistics for all devices
-Router.post('/update-all-esp-stats', async (req, res) => {
-  try {
-    const results = await DeviceStatsService.updateAllESPStats();
-    res.status(200).json({ message: 'All ESP stats updated', results });
-  } catch (err) {
-    res.status(500).json({ message: 'Error updating all ESP stats', error: err.message });
-  }
-});
-
-// Get ESP-level statistics for dashboard
+// Total PIC experiences across ESPs in range (success/failure totals)
 Router.get('/dashboard-esp-stats', async (req, res) => {
   try {
     const { startDate, endDate, projectId } = req.query;
-    
-    if (!startDate || !endDate) {
-      return res.status(400).json({ message: 'startDate and endDate are required' });
+    const start = startDate ? new Date(startDate) : new Date(new Date().toISOString().slice(0,10));
+    const end = endDate ? new Date(endDate) : new Date();
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+      return res.status(400).json({ message: 'Invalid startDate or endDate' });
     }
-    
-    const stats = await DeviceStatsService.getDashboardESPStats(
-      new Date(startDate),
-      new Date(endDate),
-      projectId
-    );
-    
-    res.status(200).json(stats);
+    const stats = await DeviceStatsService.getDashboardESPStats(start, end, projectId || null);
+    return res.json(stats);
   } catch (err) {
-    res.status(500).json({ message: 'Error fetching dashboard ESP stats', error: err.message });
+    return res.status(500).json({ message: 'Error computing dashboard ESP stats', error: err.message });
   }
 });
 
-// Get server time for debugging
-Router.get('/server-time', (req, res) => {
-  const now = new Date();
-  const utcNow = new Date(now.toISOString());
-  
-  console.log('=== SERVER TIME DEBUG ===');
-  console.log('Current Date Object:', now);
-  console.log('Current Date String:', now.toString());
-  console.log('Current ISO String:', now.toISOString());
-  console.log('Current UTC Date:', utcNow.toISOString());
-  console.log('Current Timestamp:', now.getTime());
-  console.log('Timezone:', Intl.DateTimeFormat().resolvedOptions().timeZone);
-  
-  res.status(200).json({
-    currentTime: now.toISOString(),
-    localTime: now.toString(),
-    utcTime: utcNow.toISOString(),
-    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-    timestamp: now.getTime(),
-    dateOnly: now.toISOString().split('T')[0],
-    debug: {
-      year: now.getFullYear(),
-      month: now.getMonth() + 1,
-      day: now.getDate(),
-      hours: now.getHours(),
-      minutes: now.getMinutes(),
-      seconds: now.getSeconds()
-    }
-  });
-});
-
-// Add new OTA update or update existing record
-Router.post('/', async (req, res) => {
+Router.get('/daily-device-stats', async (req, res) => {
   try {
-    const { pic_id, deviceId, status, previousVersion, updatedVersion, date } = req.body;
-    if (!pic_id || !deviceId || !status || !previousVersion || !updatedVersion) {
-      return res.status(400).json({ message: 'All fields are required' });
+    const { startDate, endDate, projectId } = req.query;
+    const start = startDate ? new Date(startDate) : new Date(new Date().toISOString().slice(0,10));
+    const end = endDate ? new Date(endDate) : new Date();
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+      return res.status(400).json({ message: 'Invalid startDate or endDate' });
     }
-    
-    // Check if a record already exists for this PIC ID and firmware version
-    let existingUpdate = await OTAUpdate.findOne({ 
-      pic_id, 
-      updatedVersion 
-    });
-    
-    let updateRecord;
-    
-    if (existingUpdate) {
-      // Update existing record with new status entry
-      console.log(`Updating existing record for PIC ${pic_id}, version ${updatedVersion}`);
-      
-      // Get status message from status management
-      let statusMessage = status;
-      const statusEntry = await StatusManagement.findOne({ deviceId });
-      if (statusEntry && statusEntry.statusCodes) {
-        const statusCode = parseInt(status);
-        if (!isNaN(statusCode)) {
-          const matchingCode = statusEntry.statusCodes.find(code => code.code === statusCode);
-          if (matchingCode) {
-            statusMessage = matchingCode.message;
-          }
-        }
-      }
-      
-      // Add new status entry to existing record
-      existingUpdate.addStatusEntry(status, statusMessage);
-      await existingUpdate.save();
-      updateRecord = existingUpdate;
-      
-    } else {
-      // Create new record
-      console.log(`Creating new record for PIC ${pic_id}, version ${updatedVersion}`);
-      
-      // Handle date - use provided date or current time
-      let updateDate;
-      if (date) {
-        updateDate = new Date(date);
-        if (isNaN(updateDate.getTime())) {
-          return res.status(400).json({ message: 'Invalid date format' });
-        }
-      } else {
-        updateDate = new Date();
-      }
-      
-      // Get status message from status management
-      let statusMessage = status;
-      const statusEntry = await StatusManagement.findOne({ deviceId });
-      if (statusEntry && statusEntry.statusCodes) {
-        const statusCode = parseInt(status);
-        if (!isNaN(statusCode)) {
-          const matchingCode = statusEntry.statusCodes.find(code => code.code === statusCode);
-          if (matchingCode) {
-            statusMessage = matchingCode.message;
-          }
-        }
-      }
-      
-      const newUpdate = new OTAUpdate({ 
-        pic_id, 
-        deviceId, 
-        previousVersion, 
-        updatedVersion,
-        date: updateDate
-      });
-      
-      // Add initial status entry
-      newUpdate.addStatusEntry(status, statusMessage);
-      await newUpdate.save();
-      updateRecord = newUpdate;
-    }
-    
-    // Update device statistics
-    try {
-      await DeviceStatsService.updateDeviceStats(deviceId);
-    } catch (statsError) {
-      console.error('Error updating device stats:', statsError);
-      // Don't fail the main request if stats update fails
-    }
-    
-    // Update ESP statistics
-    try {
-      await DeviceStatsService.updateESPStats(deviceId);
-    } catch (espStatsError) {
-      console.error('Error updating ESP stats:', espStatsError);
-      // Don't fail the main request if ESP stats update fails
-    }
-    
-    // Log activity for OTA update
-    try {
-      const defaultUserId = '507f1f77bcf86cd799439011';
-      const latestStatus = updateRecord.getLatestStatus();
-      await ActivityLogger.logOTAUpdate(
-        defaultUserId,
-        deviceId,
-        latestStatus ? latestStatus.status : status,
-        updatedVersion,
-        {
-          pic_id,
-          previousVersion,
-          totalAttempts: updateRecord.totalAttempts,
-          finalStatus: updateRecord.finalStatus
-        }
-      );
-    } catch (activityError) {
-      console.error('Error logging activity:', activityError);
-    }
-    
-    res.status(201).json(updateRecord);
+    const stats = await DeviceStatsService.getDailyDeviceStats(start, end, projectId || null);
+    return res.json(stats);
   } catch (err) {
-    if (err.code === 11000) {
-      // Duplicate key error - this shouldn't happen with our logic, but handle it gracefully
-      return res.status(409).json({ message: 'Record already exists for this PIC ID and firmware version' });
-    }
-    res.status(500).json({ message: 'Error adding OTA update', error: err.message });
+    return res.status(500).json({ message: 'Error computing daily device stats', error: err.message });
   }
 });
 
-// Delete OTA update
-Router.delete('/:id', async (req, res) => {
+Router.get('/weekly-device-stats', async (req, res) => {
   try {
-    const deleted = await OTAUpdate.findByIdAndDelete(req.params.id);
-    if (!deleted) return res.status(404).json({ message: 'OTA update not found' });
-    
-    // Update device statistics after deletion
-    try {
-      await DeviceStatsService.updateDeviceStats(deleted.deviceId);
-    } catch (statsError) {
-      console.error('Error updating device stats after deletion:', statsError);
+    const { startDate, endDate, projectId } = req.query;
+    const start = startDate ? new Date(startDate) : new Date(new Date().toISOString().slice(0,10));
+    const end = endDate ? new Date(endDate) : new Date();
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+      return res.status(400).json({ message: 'Invalid startDate or endDate' });
     }
-    
-    // Update ESP statistics after deletion
-    try {
-      await DeviceStatsService.updateESPStats(deleted.deviceId);
-    } catch (espStatsError) {
-      console.error('Error updating ESP stats after deletion:', espStatsError);
-    }
-    
-    res.status(200).json({ message: 'OTA update deleted' });
+    const stats = await DeviceStatsService.getWeeklyDeviceStats(start, end, projectId || null);
+    return res.json(stats);
   } catch (err) {
-    res.status(500).json({ message: 'Error deleting OTA update', error: err.message });
+    return res.status(500).json({ message: 'Error computing weekly device stats', error: err.message });
   }
 });
 
-module.exports = Router; 
+
