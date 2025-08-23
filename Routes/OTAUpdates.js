@@ -1,413 +1,404 @@
 const Router = require('express').Router();
 const OTAUpdate = require('../Models/OTAUpdateModel');
 const StatusManagement = require('../Models/StatusManagementModel');
-const Device = require('../Models/DeviceModel');
-const DeviceStatsService = require('../Services/DeviceStatsService');
+const DashboardStats = require('../Models/DashboardStatsModel');
 
-// Helper: map raw status code to message/badge/color using StatusManagement
-async function resolveStatusForDevice(deviceId, rawStatus) {
-  const statusEntry = await StatusManagement.findOne({ deviceId });
-  let message = String(rawStatus);
-  let badge = 'other';
-  let color = undefined;
-
-  const code = parseInt(rawStatus);
+// Helper function to determine update type based on versions
+const determineUpdateType = (previousVersion, updatedVersion) => {
+  // Convert versions to numbers for comparison
+  const prev = parseFloat(previousVersion);
+  const updated = parseFloat(updatedVersion);
   
-  // Check if status indicates "already updated" - treat as success
-  if (message.toLowerCase().includes('already updated') || 
-      message.toLowerCase().includes('already up to date') ||
-      message.toLowerCase().includes('no update needed') ||
-      message.toLowerCase().includes('firmware already current') ||
-      message.toLowerCase().includes('version already installed') ||
-      message.toLowerCase().includes('no update required') ||
-      message.toLowerCase().includes('current version running')) {
-    badge = 'success';
-    color = '#16a34a'; // Green color for success
-  }
-  // Check if status indicates "up to date" - treat as success
-  else if (message.toLowerCase().includes('up to date') ||
-           message.toLowerCase().includes('current version')) {
-    badge = 'success';
-    color = '#16a34a'; // Green color for success
-  }
-  // Check if status indicates "successful update" - treat as success
-  else if (message.toLowerCase().includes('success') ||
-           message.toLowerCase().includes('updated successfully') ||
-           message.toLowerCase().includes('update complete') ||
-           message.toLowerCase().includes('update finished') ||
-           message.toLowerCase().includes('installation complete') ||
-           message.toLowerCase().includes('firmware installed') ||
-           message.toLowerCase().includes('update successful')) {
-    badge = 'success';
-    color = '#16a34a'; // Green color for success
-  }
-  // Check if status indicates "update failed" - treat as failure
-  else if (message.toLowerCase().includes('failed') ||
-           message.toLowerCase().includes('error') ||
-           message.toLowerCase().includes('update failed')) {
-    badge = 'failure';
-    color = '#dc2626'; // Red color for failure
-  }
-  // Check if status indicates "in progress" or "pending" - treat as other
-  else if (message.toLowerCase().includes('in progress') ||
-           message.toLowerCase().includes('pending') ||
-           message.toLowerCase().includes('downloading') ||
-           message.toLowerCase().includes('installing')) {
-    badge = 'other';
-    color = '#f59e0b'; // Amber color for in progress
+  // Check if updatedVersion is "0.0" (failure case)
+  if (updatedVersion === "0.0") {
+    return 'failure';
   }
   
-  // If we have a numeric status code and StatusManagement configuration, use that
-  if (statusEntry && statusEntry.statusCodes && !isNaN(code)) {
-    const match = statusEntry.statusCodes.find(sc => sc.code === code);
-    if (match) {
-      message = match.message;
-      badge = match.badge || badge; // Use configured badge if available, otherwise keep our logic
-      color = match.color || color; // Use configured color if available, otherwise keep our logic
+  // Check if previousVersion < updatedVersion (success case)
+  if (prev < updated) {
+    return 'success';
+  }
+  
+  // If versions are equal or previous > updated
+  return 'other';
+};
+
+// Helper function to get today's date at midnight in local timezone
+const getTodayDate = () => {
+  const today = new Date();
+  
+  // Get current local date components
+  const year = today.getFullYear();
+  const month = today.getMonth();
+  const day = today.getDate();
+  
+  // Create a new date at midnight in local timezone
+  const localMidnight = new Date(year, month, day, 0, 0, 0, 0);
+  
+  console.log(`📅 getTodayDate: Current time: ${today.toISOString()}`);
+  console.log(`📅 getTodayDate: Local midnight: ${localMidnight.toISOString()}`);
+  console.log(`📅 getTodayDate: Local date string: ${localMidnight.toLocaleDateString()}`);
+  
+  return localMidnight;
+};
+
+// Helper function to find or create dashboard stats for a device and date
+const findOrCreateDashboardStats = async (deviceId, date) => {
+  try {
+    // Ensure date is a proper Date object and normalize to local midnight
+    const normalizedDate = new Date(date);
+    const year = normalizedDate.getFullYear();
+    const month = normalizedDate.getMonth();
+    const day = normalizedDate.getDate();
+    const localMidnight = new Date(year, month, day, 0, 0, 0, 0);
+    
+    console.log(`📅 findOrCreateDashboardStats: Input date: ${date}`);
+    console.log(`📅 findOrCreateDashboardStats: Normalized local midnight: ${localMidnight.toISOString()}`);
+    console.log(`📅 findOrCreateDashboardStats: Local date string: ${localMidnight.toLocaleDateString()}`);
+    
+    // Find existing stats for this device and date
+    // Use a wider range to account for timezone differences
+    const startOfDay = new Date(localMidnight);
+    const endOfDay = new Date(localMidnight);
+    endOfDay.setDate(endOfDay.getDate() + 1);
+    
+    let stats = await DashboardStats.findOne({
+      deviceId: deviceId,
+      'stats.date': {
+        $gte: startOfDay,
+        $lt: endOfDay
+      }
+    });
+    
+    if (!stats) {
+      // Create new stats document - the pre-save middleware will handle structure
+      stats = new DashboardStats({
+        deviceId: deviceId,
+        stats: {
+          date: localMidnight
+        }
+      });
+      console.log('📊 Created new dashboard stats for device:', deviceId, 'date:', localMidnight.toLocaleDateString());
+    } else {
+      console.log('📊 Found existing dashboard stats for device:', deviceId, 'date:', stats.stats.date.toLocaleDateString());
+      
+      // Check if the existing document has incorrect structure and fix it
+      if (Array.isArray(stats.stats)) {
+        console.log('⚠️  Found incorrect stats structure (array), fixing...');
+        // Extract the first stats object if it's an array
+        const firstStats = stats.stats[0];
+        if (firstStats && firstStats.date) {
+          stats.stats = {
+            date: localMidnight,
+            records: {
+              success: [],
+              failure: [],
+              other: []
+            }
+          };
+          console.log('✅ Fixed stats structure from array to object');
+        } else {
+          // If we can't extract valid data, create new structure
+          stats.stats = {
+            date: localMidnight,
+            records: {
+              success: [],
+              failure: [],
+              other: []
+            }
+          };
+          console.log('✅ Created new stats structure');
+        }
+      } else if (!stats.stats || typeof stats.stats !== 'object') {
+        // If stats is not an object, create proper structure
+        console.log('⚠️  Found invalid stats structure, creating new one...');
+        stats.stats = {
+          date: localMidnight,
+          records: {
+            success: [],
+            failure: [],
+            other: []
+          }
+        };
+      } else {
+        // Ensure the date is current
+        stats.stats.date = localMidnight;
+        
+        // Ensure records arrays exist
+        if (!stats.stats.records) {
+          stats.stats.records = { success: [], failure: [], other: [] };
+        }
+        if (!Array.isArray(stats.stats.records.success)) {
+          stats.stats.records.success = [];
+        }
+        if (!Array.isArray(stats.stats.records.failure)) {
+          stats.stats.records.failure = [];
+        }
+        if (!Array.isArray(stats.stats.records.other)) {
+          stats.stats.records.other = [];
+        }
+      }
     }
+    
+    return stats;
+  } catch (error) {
+    console.error('Error in findOrCreateDashboardStats:', error);
+    throw error;
   }
-  
-  // Fallback: if we have a numeric code, use the existing logic (2 or 3 = success)
-  if (!isNaN(code)) {
-    if (code === 2 || code === 3) {
-      badge = 'success';
-      color = '#16a34a';
-    } else if (code === 0 || code === 1) {
-      badge = 'failure';
-      color = '#dc2626';
-    }
-  }
-  
-  return { message, badge, color };
-}
+};
 
-// Ingest report from ESP32
-// POST /ota-updates/
-// Body: { pic_id, deviceId, status, previousVersion, updatedVersion, date? }
+// POST: Receive ESP32 OTA update report
 Router.post('/', async (req, res) => {
   try {
-    const { pic_id, deviceId, status, previousVersion, updatedVersion, date } = req.body || {};
+    const { pic_id, deviceId, status, previousVersion, updatedVersion } = req.body;
+    
+    // Validate required fields
     if (!pic_id || !deviceId || !status || !previousVersion || !updatedVersion) {
-      return res.status(400).json({ message: 'pic_id, deviceId, status, previousVersion, updatedVersion are required' });
-    }
-
-    const entryDate = date ? new Date(date) : new Date();
-    if (date && isNaN(entryDate.getTime())) {
-      return res.status(400).json({ message: 'Invalid date format' });
-    }
-
-    const { message, badge, color } = await resolveStatusForDevice(deviceId, status);
-
-    // Find existing record for this PIC and target version, else create
-    let record = await OTAUpdate.findOne({ pic_id, updatedVersion });
-    if (!record) {
-      record = new OTAUpdate({
-        pic_id,
-        deviceId,
-        previousVersion,
-        updatedVersion,
-        date: entryDate
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required fields: pic_id, deviceId, status, previousVersion, updatedVersion'
       });
     }
-
-    // Append status entry with resolved message and badge/color
-    record.addStatusEntry(status, message, entryDate, badge, color);
-    await record.save();
-
-    // Update device-level stats and ESP-level stats
-    try { await DeviceStatsService.updateDeviceStats(deviceId); } catch (_) {}
-    try { await DeviceStatsService.updateESPStats(deviceId); } catch (_) {}
-
-    return res.status(201).json({
-      message: 'OTA update ingested',
-      data: record
-    });
-  } catch (err) {
-    if (err && err.code === 11000) {
-      return res.status(409).json({ message: 'Duplicate PIC/version record' });
-    }
-    return res.status(500).json({ message: 'Error ingesting OTA update', error: err.message });
-  }
-});
-
-// Cards summary for OTAUpdates page (total success/failure/other by attempts)
-Router.get('/cards-summary', async (req, res) => {
-  try {
-    const { deviceId } = req.query;
-    const filter = {};
-    if (deviceId) filter.deviceId = deviceId;
-    const updates = await OTAUpdate.find(filter);
-
-    let success = 0, failure = 0, other = 0, total = 0;
-    updates.forEach(u => {
-      u.statusEntries.forEach(e => {
-        total += 1;
-        if (e.badge === 'success') success += 1;
-        else if (e.badge === 'failure') failure += 1;
-        else other += 1;
+    
+    // Fetch status management data for the device
+    const statusManagement = await StatusManagement.findOne({ deviceId: deviceId });
+    if (!statusManagement) {
+      return res.status(404).json({
+        success: false,
+        message: 'Status management configuration not found for this device'
       });
+    }
+    
+    // Find the status code configuration
+    const statusCode = statusManagement.statusCodes.find(sc => sc.code.toString() === status);
+    if (!statusCode) {
+      return res.status(404).json({
+        success: false,
+        message: 'Status code not found in status management configuration'
+      });
+    }
+    
+    // Determine update type
+    const updateType = determineUpdateType(previousVersion, updatedVersion);
+    
+    // Create timestamp for this update
+    const timestamp = new Date();
+    
+    // Create OTA update record
+    const otaUpdate = new OTAUpdate({
+      pic_id,
+      deviceId,
+      status,
+      previousVersion,
+      updatedVersion,
+      statusMessage: statusCode.message,
+      badge: statusCode.badge,
+      color: statusCode.color,
+      timestamp: timestamp
     });
-
-    return res.json({ success, failure, other, total });
-  } catch (err) {
-    return res.status(500).json({ message: 'Error computing cards summary', error: err.message });
-  }
-});
-
-// Daily unique counts for dashboard with dedup: success overrides failure within same day
-// Query: startDate, endDate, projectId?, deviceId?
-Router.get('/daily-unique-stats', async (req, res) => {
-  try {
-    const { startDate, endDate, projectId, deviceId } = req.query;
-    const start = startDate ? new Date(startDate) : new Date(new Date().toISOString().slice(0,10));
-    const end = endDate ? new Date(endDate) : new Date();
-    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
-      return res.status(400).json({ message: 'Invalid startDate or endDate' });
-    }
-
-    // If projectId is present, restrict allowed deviceIds to devices in that project
-    let allowedDeviceIds = null;
-    if (projectId) {
-      const projectDevices = await Device.find({ project: projectId }, { deviceId: 1 });
-      allowedDeviceIds = new Set(projectDevices.map(d => d.deviceId));
-    }
-
-    // Fetch records that have any statusEntries within the date range.
-    // This ensures older records whose lastUpdated is outside the range are still considered.
-    const findFilter = {
-      statusEntries: { $elemMatch: { date: { $gte: start, $lte: end } } }
+    
+    // Save OTA update
+    await otaUpdate.save();
+    
+    // Handle dashboard stats
+    const today = getTodayDate();
+    const dashboardStats = await findOrCreateDashboardStats(deviceId, today);
+    
+    // Create record for dashboard
+    const record = {
+      picID: pic_id,
+      deviceId: deviceId,
+      previousVersion: previousVersion,
+      updatedVersion: updatedVersion,
+      timestamp: timestamp,
+      date: new Date()
     };
-    if (deviceId) {
-      findFilter.deviceId = deviceId;
-    } else if (allowedDeviceIds) {
-      findFilter.deviceId = { $in: Array.from(allowedDeviceIds) };
+    
+    if (updateType === 'success') {
+      // Check if this PIC ID exists in failure records for today and remove it
+      // Note: We remove by PIC ID only, as the same PIC ID can have multiple attempts
+      if (Array.isArray(dashboardStats.stats.records.failure)) {
+        dashboardStats.stats.records.failure = dashboardStats.stats.records.failure.filter(
+          r => r.picID !== pic_id
+        );
+      } else {
+        dashboardStats.stats.records.failure = [];
+      }
+      
+      // Add to success records
+      if (Array.isArray(dashboardStats.stats.records.success)) {
+        dashboardStats.stats.records.success.push(record);
+      } else {
+        dashboardStats.stats.records.success = [record];
+      }
+      
+    } else if (updateType === 'failure') {
+      // Check if this exact record already exists in failure (by PIC ID, versions, and timestamp)
+      // Using timestamp ensures we can track multiple attempts with the same PIC ID
+      let existingFailure = false;
+      if (Array.isArray(dashboardStats.stats.records.failure)) {
+        existingFailure = dashboardStats.stats.records.failure.find(
+          r => r.picID === pic_id && 
+               r.previousVersion === previousVersion && 
+               r.updatedVersion === updatedVersion &&
+               r.timestamp.getTime() === timestamp.getTime()
+        );
+      }
+      
+      // Only add if not already present
+      if (!existingFailure) {
+        if (Array.isArray(dashboardStats.stats.records.failure)) {
+          dashboardStats.stats.records.failure.push(record);
+        } else {
+          dashboardStats.stats.records.failure = [record];
+        }
+      }
+      
+    } else {
+      // For 'other' type, just add to other records
+      if (Array.isArray(dashboardStats.stats.records.other)) {
+        dashboardStats.stats.records.other.push(record);
+      } else {
+        dashboardStats.stats.records.other = [record];
+      }
     }
-    const all = await OTAUpdate.find(findFilter);
-
-    // Expand to attempt-level entries carrying their dates and PIC IDs
-    const entries = [];
-    all.forEach(update => {
-      if (allowedDeviceIds && !allowedDeviceIds.has(update.deviceId)) return;
-      update.statusEntries.forEach(entry => {
-        const d = entry.date ? new Date(entry.date) : new Date(update.lastUpdated);
-        if (d >= start && d <= end) {
-          entries.push({
-            deviceId: update.deviceId,
-            pic_id: update.pic_id,
-            updatedVersion: update.updatedVersion,
-            date: d,
-            badge: entry.badge || 'other'
-          });
-        }
-      });
-    });
-
-    // Prepare day buckets
-    const byDay = new Map();
-    entries.forEach(e => {
-      const dayKey = new Date(Date.UTC(e.date.getUTCFullYear(), e.date.getUTCMonth(), e.date.getUTCDate())).toISOString().slice(0,10);
-      if (!byDay.has(dayKey)) byDay.set(dayKey, []);
-      byDay.get(dayKey).push(e);
-    });
-
-    // For each day, count unique successes per (PIC_ID, updatedVersion).
-    // If a PIC has failures/others earlier and later succeeds in the same day (any version),
-    // drop those earlier non-success entries for that day.
-    const daily = [];
-
-    // Iterate through every day in range to include zero-activity days
-    const walkDate = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate()));
-    const endDay = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), end.getUTCDate()));
-    while (walkDate <= endDay) {
-      const dayKey = new Date(Date.UTC(
-        walkDate.getUTCFullYear(),
-        walkDate.getUTCMonth(),
-        walkDate.getUTCDate()
-      )).toISOString().slice(0,10);
-      const list = byDay.get(dayKey) || [];
-
-      // Track last success time per PIC in this day
-      const lastSuccessByPic = new Map(); // pic_id -> Date
-      list.forEach(e => {
-        // Treat "already updated" as success for counting purposes
-        if (e.badge === 'success' || e.badge === 'other') {
-          const prev = lastSuccessByPic.get(e.pic_id);
-          if (!prev || e.date > prev) lastSuccessByPic.set(e.pic_id, e.date);
-        }
-      });
-
-      // Track the last outcome for each (pic_id, updatedVersion) tuple
-      const lastByTuple = new Map(); // key: pic|version -> { badge, date, deviceId }
-      list.forEach(e => {
-        const key = `${e.pic_id}|${e.updatedVersion}`;
-        const prev = lastByTuple.get(key);
-        if (!prev || e.date > prev.date) {
-          lastByTuple.set(key, { badge: e.badge, date: e.date, deviceId: e.deviceId });
-        }
-      });
-
-      let success = 0, failure = 0, total = 0;
-      const successDevices = new Set();
-      const failureDevices = new Set();
-      lastByTuple.forEach((val, key) => {
-        const [picId] = key.split('|');
-        const lastSucc = lastSuccessByPic.get(picId);
-        
-        // If there is a later success for this PIC and this tuple's final outcome
-        // happened before that success and is not success, drop it
-        if (val.badge !== 'success' && val.badge !== 'other' && lastSucc && val.date < lastSucc) {
-          return;
-        }
-        
-        total += 1;
-        // Treat "other" (including "already updated") as success for counting
-        if (val.badge === 'success' || val.badge === 'other') { 
-          success += 1; 
-          successDevices.add(val.deviceId); 
-        }
-        else if (val.badge === 'failure') { 
-          failure += 1; 
-          failureDevices.add(val.deviceId); 
-        }
-      });
-
-      daily.push({ 
-        date: dayKey, 
-        success, 
-        failure, 
-        total,
-        successDevices: Array.from(successDevices),
-        failureDevices: Array.from(failureDevices)
-      });
-
-      // next day
-      walkDate.setUTCDate(walkDate.getUTCDate() + 1);
+    
+    // Save dashboard stats
+    try {
+      await dashboardStats.save();
+      console.log('✅ Dashboard stats saved successfully');
+    } catch (saveError) {
+      console.error('❌ Error saving dashboard stats:', saveError);
+      if (saveError.name === 'ValidationError') {
+        console.error('Validation errors:', saveError.errors);
+        console.error('Stats document structure:', JSON.stringify(dashboardStats, null, 2));
+      }
+      throw new Error(`Failed to save dashboard stats: ${saveError.message}`);
     }
-
-    return res.json({ range: { start: start.toISOString(), end: end.toISOString() }, daily });
-  } catch (err) {
-    return res.status(500).json({ message: 'Error computing daily unique stats', error: err.message });
+    
+    res.status(200).json({
+      success: true,
+      message: 'OTA update report processed successfully',
+      data: {
+        otaUpdate: otaUpdate,
+        dashboardStats: dashboardStats,
+        updateType: updateType,
+        timestamp: timestamp
+      }
+    });
+    
+  } catch (error) {
+    console.error('Error processing OTA update report:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error',
+      error: error.message
+    });
   }
 });
 
-// List OTA updates (optionally by deviceId)
+// GET: Retrieve OTA updates with optional filtering
 Router.get('/', async (req, res) => {
   try {
-    const { deviceId } = req.query;
-    const filter = deviceId ? { deviceId } : {};
-    const updates = await OTAUpdate.find(filter).sort({ lastUpdated: -1 });
-    return res.json(updates);
-  } catch (err) {
-    return res.status(500).json({ message: 'Error fetching updates', error: err.message });
-  }
-});
-
-// Flattened attempts view for terminal-like history (do not apply dashboard dedup rules)
-// GET /ota-updates/attempts?deviceId=&projectId=
-Router.get('/attempts', async (req, res) => {
-  try {
-    const { deviceId, projectId } = req.query;
-
-    // Build base filter
-    const baseFilter = deviceId ? { deviceId } : {};
-    const updates = await OTAUpdate.find(baseFilter).sort({ lastUpdated: -1 });
-
-    // Optional project filter needs device lookup
-    let allowedDeviceIds = null;
-    if (projectId) {
-      const projectDevices = await Device.find({ project: projectId }, { deviceId: 1 });
-      allowedDeviceIds = new Set(projectDevices.map(d => d.deviceId));
+    const { deviceId, projectId, limit = 100, page = 1 } = req.query;
+    
+    let query = {};
+    if (deviceId) {
+      query.deviceId = deviceId;
     }
-
-    const attempts = [];
-    updates.forEach(update => {
-      if (allowedDeviceIds && !allowedDeviceIds.has(update.deviceId)) return;
-      (update.statusEntries || []).forEach((entry, idx) => {
-        attempts.push({
-          attemptId: `${update._id}:${entry.attemptNumber || idx + 1}`,
-          recordId: update._id,
-          deviceId: update.deviceId,
-          pic_id: update.pic_id,
-          previousVersion: update.previousVersion,
-          updatedVersion: update.updatedVersion,
-          status: entry.status,
-          statusMessage: entry.statusMessage,
-          badge: entry.badge || 'other',
-          color: entry.color,
-          date: entry.date || update.lastUpdated,
-          attemptNumber: entry.attemptNumber || idx + 1
-        });
-      });
+    
+    // If projectId is provided, we need to filter by devices in that project
+    if (projectId) {
+      // This would require a join with the Device model to get devices in the project
+      // For now, we'll handle this in the frontend by filtering after fetching
+      // In a production environment, you might want to use aggregation pipeline
+    }
+    
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    const updates = await OTAUpdate.find(query)
+      .sort({ timestamp: -1, createdAt: -1 })
+      .limit(parseInt(limit))
+      .skip(skip);
+    
+    const total = await OTAUpdate.countDocuments(query);
+    
+    res.status(200).json({
+      success: true,
+      data: updates,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        pages: Math.ceil(total / parseInt(limit))
+      }
     });
-
-    // Sort newest first by date
-    attempts.sort((a, b) => new Date(b.date) - new Date(a.date));
-
-    return res.json(attempts);
-  } catch (err) {
-    return res.status(500).json({ message: 'Error fetching attempts', error: err.message });
+    
+  } catch (error) {
+    console.error('Error retrieving OTA updates:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error',
+      error: error.message
+    });
   }
 });
 
-// Delete an OTA update by id
+// GET: Get OTA update by ID
+Router.get('/:id', async (req, res) => {
+  try {
+    const update = await OTAUpdate.findById(req.params.id);
+    
+    if (!update) {
+      return res.status(404).json({
+        success: false,
+        message: 'OTA update not found'
+      });
+    }
+    
+    res.status(200).json({
+      success: true,
+      data: update
+    });
+    
+  } catch (error) {
+    console.error('Error retrieving OTA update:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error',
+      error: error.message
+    });
+  }
+});
+
+// DELETE: Delete OTA update by ID
 Router.delete('/:id', async (req, res) => {
   try {
-    const { id } = req.params;
-    const deleted = await OTAUpdate.findByIdAndDelete(id);
-    if (!deleted) return res.status(404).json({ message: 'Not found' });
-    return res.json({ message: 'Deleted', id });
-  } catch (err) {
-    return res.status(500).json({ message: 'Error deleting', error: err.message });
+    const update = await OTAUpdate.findByIdAndDelete(req.params.id);
+    
+    if (!update) {
+      return res.status(404).json({
+        success: false,
+        message: 'OTA update not found'
+      });
+    }
+    
+    res.status(200).json({
+      success: true,
+      message: 'OTA update deleted successfully'
+    });
+    
+  } catch (error) {
+    console.error('Error deleting OTA update:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error',
+      error: error.message
+    });
   }
 });
 
 module.exports = Router;
-// Additional dashboard stats endpoints for convenience/compatibility
 
-// Total PIC experiences across ESPs in range (success/failure totals)
-Router.get('/dashboard-esp-stats', async (req, res) => {
-  try {
-    const { startDate, endDate, projectId } = req.query;
-    const start = startDate ? new Date(startDate) : new Date(new Date().toISOString().slice(0,10));
-    const end = endDate ? new Date(endDate) : new Date();
-    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
-      return res.status(400).json({ message: 'Invalid startDate or endDate' });
-    }
-    const stats = await DeviceStatsService.getDashboardESPStats(start, end, projectId || null);
-    return res.json(stats);
-  } catch (err) {
-    return res.status(500).json({ message: 'Error computing dashboard ESP stats', error: err.message });
-  }
-});
-
-Router.get('/daily-device-stats', async (req, res) => {
-  try {
-    const { startDate, endDate, projectId } = req.query;
-    const start = startDate ? new Date(startDate) : new Date(new Date().toISOString().slice(0,10));
-    const end = endDate ? new Date(endDate) : new Date();
-    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
-      return res.status(400).json({ message: 'Invalid startDate or endDate' });
-    }
-    const stats = await DeviceStatsService.getDailyDeviceStats(start, end, projectId || null);
-    return res.json(stats);
-  } catch (err) {
-    return res.status(500).json({ message: 'Error computing daily device stats', error: err.message });
-  }
-});
-
-Router.get('/weekly-device-stats', async (req, res) => {
-  try {
-    const { startDate, endDate, projectId } = req.query;
-    const start = startDate ? new Date(startDate) : new Date(new Date().toISOString().slice(0,10));
-    const end = endDate ? new Date(endDate) : new Date();
-    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
-      return res.status(400).json({ message: 'Invalid startDate or endDate' });
-    }
-    const stats = await DeviceStatsService.getWeeklyDeviceStats(start, end, projectId || null);
-    return res.json(stats);
-  } catch (err) {
-    return res.status(500).json({ message: 'Error computing weekly device stats', error: err.message });
-  }
-});
 
 
