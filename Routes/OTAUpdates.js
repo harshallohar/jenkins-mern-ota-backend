@@ -80,7 +80,7 @@ const findOrCreateDashboardStats = async (deviceId, date) => {
 };
 
 // POST: Receive ESP32 OTA update report
-Router.post('/report', async (req, res) => {
+Router.post('/', async (req, res) => {
   try {
     const { pic_id, deviceId, status, previousVersion, updatedVersion } = req.body;
 
