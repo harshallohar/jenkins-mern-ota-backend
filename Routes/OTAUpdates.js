@@ -177,7 +177,7 @@ Router.post('/', async (req, res) => {
       await dashboardStats.save();
       console.log('✅ Dashboard stats saved successfully');
     } catch (saveError) {
-      console.error('❌ Error saving dashboard stats:', saveError);
+      console.error('❌ Error saving dashboard stats records:', saveError);
       throw new Error(`Failed to save dashboard stats: ${saveError.message}`);
     }
 
