@@ -80,7 +80,7 @@ const findOrCreateDashboardStats = async (deviceId, date) => {
 };
 
 // POST: Receive ESP32 OTA update report
-Router.post('/', async (req, res) => {
+Router.post('/report', async (req, res) => {
   try {
     const { pic_id, deviceId, status, previousVersion, updatedVersion } = req.body;
 
@@ -177,7 +177,7 @@ Router.post('/', async (req, res) => {
       await dashboardStats.save();
       console.log('✅ Dashboard stats saved successfully');
     } catch (saveError) {
-      console.error('❌ Error saving dashboard stats records:', saveError);
+      console.error('❌ Error saving dashboard stats:', saveError);
       throw new Error(`Failed to save dashboard stats: ${saveError.message}`);
     }
 
@@ -202,20 +202,11 @@ Router.post('/', async (req, res) => {
   }
 });
 
-
-// GET: Retrieve OTA updates with optional filtering, plus aggregated counts
-Router.get('/', async (req, res) => {
+Router.get('/versions', async (req, res) => {
   try {
-    const {
-      deviceId,
-      projectId,
-      limit = 100,
-      page = 1,
-      badge,          // optional: 'success'|'failure'|'other'|'all'
-      versionQuery    // optional: string to search versions (behavior below)
-    } = req.query;
+    const { deviceId, projectId, badge } = req.query;
 
-    // Build base query (applied to counts and listing)
+    // Build base query similar to main listing
     let baseQuery = {};
 
     if (deviceId) {
@@ -226,7 +217,67 @@ Router.get('/', async (req, res) => {
     if (projectId) {
       const deviceIds = await Device.find({ project: projectId }).distinct('deviceId');
       if (!deviceIds || deviceIds.length === 0) {
-        // nothing for this project
+        return res.status(200).json({
+          success: true,
+          versions: []
+        });
+      }
+      baseQuery.deviceId = { $in: deviceIds };
+    }
+
+    // Determine which version field to get based on badge filter
+    let versionField = 'updatedVersion';
+    if (badge === 'failure') {
+      versionField = 'previousVersion';
+    }
+
+    // Get distinct versions for the appropriate field
+    const versions = await OTAUpdate.distinct(versionField, baseQuery);
+    
+    // Filter out null/empty values and sort
+    const cleanVersions = versions
+      .filter(v => v && v.trim() !== '')
+      .sort()
+      .map(version => ({
+        value: version,
+        label: version
+      }));
+
+    res.status(200).json({
+      success: true,
+      versions: cleanVersions
+    });
+
+  } catch (error) {
+    console.error('Error retrieving versions:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error',
+      error: error.message
+    });
+  }
+});
+
+
+// GET: Retrieve OTA updates with optional filtering, plus aggregated counts
+Router.get('/', async (req, res) => {
+  try {
+    const {
+      deviceId,
+      projectId,
+      limit = 100,
+      page = 1,
+      badge,          // optional: 'success'|'failure'|'other'|'all'
+      versionQuery    // optional: string to search versions
+    } = req.query;
+
+    let baseQuery = {};
+
+    // --- Handle projectId filter ---
+    let projectDeviceIds = [];
+    if (projectId) {
+      projectDeviceIds = await Device.find({ project: projectId }).distinct('deviceId');
+      if (!projectDeviceIds || projectDeviceIds.length === 0) {
         return res.status(200).json({
           success: true,
           data: [],
@@ -234,45 +285,50 @@ Router.get('/', async (req, res) => {
           counts: { success: 0, failure: 0, other: 0, total: 0 }
         });
       }
-      baseQuery.deviceId = { $in: deviceIds };
     }
 
-    // If versionQuery provided, we will apply it to the appropriate version field.
-    // By convention: if badge === 'failure' -> search previousVersion; otherwise search updatedVersion.
+    // --- Merge deviceId + projectId filters ---
+    if (deviceId && projectId) {
+      // only include if this device actually belongs to that project
+      if (projectDeviceIds.includes(deviceId)) {
+        baseQuery.deviceId = deviceId;
+      } else {
+        return res.status(200).json({
+          success: true,
+          data: [],
+          pagination: { page: parseInt(page), limit: parseInt(limit), total: 0, pages: 0 },
+          counts: { success: 0, failure: 0, other: 0, total: 0 }
+        });
+      }
+    } else if (projectId) {
+      baseQuery.deviceId = { $in: projectDeviceIds };
+    } else if (deviceId) {
+      baseQuery.deviceId = deviceId;
+    }
+
+    // --- Version filtering ---
     let versionField = 'updatedVersion';
     if (badge === 'failure') versionField = 'previousVersion';
 
-    // Build a query object for counts (include versionQuery if provided)
     const countsBaseQuery = { ...baseQuery };
-    if (versionQuery && typeof versionQuery === 'string' && versionQuery.trim() !== '') {
-      const vq = versionQuery.trim();
-      countsBaseQuery[versionField] = { $regex: vq, $options: 'i' };
+    if (versionQuery && versionQuery.trim() !== '') {
+      countsBaseQuery[versionField] = { $regex: versionQuery.trim(), $options: 'i' };
     }
 
-    // For listing page, apply baseQuery plus potential badge and versionQuery filters (if badge specified, we filter listing to that badge)
     const pageQuery = { ...baseQuery };
     if (badge && badge !== 'all') {
       pageQuery.badge = badge;
     }
-    if (versionQuery && typeof versionQuery === 'string' && versionQuery.trim() !== '') {
-      const vq = versionQuery.trim();
-      pageQuery[versionField] = { $regex: vq, $options: 'i' };
+    if (versionQuery && versionQuery.trim() !== '') {
+      pageQuery[versionField] = { $regex: versionQuery.trim(), $options: 'i' };
     }
 
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    // Fetch paginated page items
-    const updates = await OTAUpdate.find(pageQuery)
-      .sort({ timestamp: -1, createdAt: -1 })
-      .limit(parseInt(limit))
-      .skip(skip)
-      .lean();
-
-    // Total count for pagination (pageQuery without limit/skip)
-    const total = await OTAUpdate.countDocuments(pageQuery);
-
-    // Compute counts per badge but using countsBaseQuery (which includes project/device and versionQuery, but NOT badge)
-    const [successCount, failureCount, otherCount] = await Promise.all([
+    // --- Data + counts ---
+    const [updates, total, successCount, failureCount, otherCount] = await Promise.all([
+      OTAUpdate.find(pageQuery).sort({ timestamp: -1, createdAt: -1 }).limit(parseInt(limit)).skip(skip).lean(),
+      OTAUpdate.countDocuments(pageQuery),
       OTAUpdate.countDocuments({ ...countsBaseQuery, badge: 'success' }),
       OTAUpdate.countDocuments({ ...countsBaseQuery, badge: 'failure' }),
       OTAUpdate.countDocuments({ ...countsBaseQuery, badge: { $nin: ['success', 'failure'] } })

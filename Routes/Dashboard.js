@@ -193,9 +193,11 @@ Router.get('/stats', authenticate, async (req, res) => {
 /**
  * GET: Get total success and failure counts for charts
  */
+// In your backend routes file, update the chart-data endpoint:
+
 Router.get('/chart-data', authenticate, async (req, res) => {
   try {
-    const { projectId, days = 7 } = req.query;
+    const { projectId, deviceId, days = 7 } = req.query;
 
     // Calculate date range using local timezone
     const today = new Date();
@@ -218,16 +220,30 @@ Router.get('/chart-data', authenticate, async (req, res) => {
       'stats.date': { $gte: startDate, $lte: endDate }
     };
 
-    // If projectId is provided, filter by devices in that project
-    if (projectId) {
+    // FIXED: Handle device filtering properly
+    if (deviceId) {
+      // If specific device is selected, filter by deviceId only
+      query.deviceId = deviceId;
+      console.log(`📅 Filtering by specific device: ${deviceId}`);
+    } else if (projectId) {
+      // If only project is selected, filter by all devices in that project
       const projectDevices = await Device.find({ project: projectId }).select('deviceId');
       const deviceIds = projectDevices.map(d => d.deviceId);
-      query.deviceId = { $in: deviceIds };
+      if (deviceIds.length > 0) {
+        query.deviceId = { $in: deviceIds };
+        console.log(`📅 Filtering by project devices: ${deviceIds.join(', ')}`);
+      } else {
+        console.log(`📅 No devices found for project: ${projectId}`);
+      }
     }
 
     // Find all dashboard stats in the date range
     const allStats = await DashboardStats.find(query).sort({ 'stats.date': 1 });
 
+    console.log(`📅 Found ${allStats.length} dashboard stats records`);
+
+    // ... rest of the function remains the same
+    
     // Aggregate total counts
     let totalSuccess = 0;
     let totalFailure = 0;

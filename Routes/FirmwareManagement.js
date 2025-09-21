@@ -5,7 +5,8 @@ const Router = require("express").Router();
 const FirmwareModel = require("../Models/FirmwareTableModel");
 const Device = require("../Models/DeviceModel");
 const Project = require("../Models/ProjectModel");
-const ActivityLogger = require("../Services/ActivityLogger");
+const FirmwareVersion = require("../Models/FirmwareVersionModel");
+
 
 // File Uploading API
 
@@ -82,73 +83,66 @@ const validateFilename = async (filename, esp_id) => {
 };
 
 // === UPLOAD API ===
-Router.post("/upload", uploadSingle, async (req, res) => {
+
+Router.post("/upload", async (req, res) => {
   try {
     const { version, description, esp_id } = req.body;
+    const file = req.file;
 
-    if (!req.file) {
-      return res.status(400).json({ message: "File is required" });
+    if (!version || !description || !esp_id || !file) {
+      return res.status(400).json({ message: "All fields are required" });
     }
 
-    // Validate filename format
-    const filenameValidation = await validateFilename(req.file.originalname, esp_id);
-    if (!filenameValidation.isValid) {
-      // Remove the uploaded file since it's invalid
-      if (req.file.path && fs.existsSync(req.file.path)) {
-        fs.unlinkSync(req.file.path);
-      }
-      return res.status(400).json({ message: filenameValidation.error });
+    // Check if version already exists for this device
+    const existingVersion = await FirmwareVersion.findOne({ deviceId: esp_id, version });
+    if (existingVersion) {
+      return res.status(400).json({ message: `Version ${version} already exists for this device.` });
     }
 
-    const fileBuffer = fs.readFileSync(req.file.path); // Read after multer saves
-
+    // Save firmware file
     const newFirmware = new FirmwareModel({
       version,
       description,
       esp_id,
-      uploadedDate: new Date(),
-      fileSize: formatFileSize(req.file.size),
-      fileData: fileBuffer,
-      fileMimeType: req.file.mimetype,
-      fileName: req.file.filename,
-      originalFileName: req.file.originalname,
+      fileData: file.buffer,
+      fileMimeType: file.mimetype,
+      fileName: file.originalname,
+      originalFileName: file.originalname,
+      fileSize: file.size,
     });
-
     await newFirmware.save();
 
-    // Log activity for firmware upload
-    try {
-      // For now, we'll use a default user ID since we don't have user context in this route
-      const defaultUserId = '507f1f77bcf86cd799439011'; // Default user ID for system activities
-      await ActivityLogger.logFirmwareUpload(
-        defaultUserId,
-        esp_id,
-        version,
-        req.file.originalname,
-        {
-          description,
-          fileSize: req.file.size,
-          fileName: req.file.filename
-        }
-      );
-    } catch (activityError) {
-      console.error('Error logging activity:', activityError);
-      // Don't fail the main request if activity logging fails
-    }
+    // Save version separately
+    const newVersion = new FirmwareVersion({
+      deviceId: esp_id,
+      version,
+    });
+    await newVersion.save();
 
-    // Remove temp file after storing in DB
-    fs.unlinkSync(req.file.path);
+    res.status(201).json({ message: "Firmware uploaded successfully", firmware: newFirmware });
 
-    res.status(200).json({ message: "Firmware uploaded and stored in DB" });
   } catch (err) {
-    console.error("Upload error:", err);
-    // Clean up uploaded file if it exists
-    if (req.file && req.file.path && fs.existsSync(req.file.path)) {
-      fs.unlinkSync(req.file.path);
-    }
-    res.status(500).json({ message: "Upload failed", error: err.message });
+    console.error(err);
+    res.status(500).json({ message: "Internal Server Error" });
   }
 });
+
+
+// firmware.js (Router)
+Router.get("/check-version", async (req, res) => {
+  try {
+    const { esp_id, version } = req.query;
+    if (!esp_id || !version) return res.status(400).json({ message: "Device ID and version required" });
+
+    const exists = await FirmwareModel.findOne({ esp_id, version });
+    if (exists) return res.json({ exists: true });
+
+    res.json({ exists: false });
+  } catch (err) {
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
 
 // Get All Firmwares Details API
 
