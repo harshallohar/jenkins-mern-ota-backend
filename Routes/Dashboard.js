@@ -28,6 +28,20 @@ function parseLocalEnd(dateStr) {
   return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999);
 }
 
+function computeRecordCounts(records = {}) {
+  const successRecords = Array.isArray(records.success) ? records.success : [];
+  const failureRecords = Array.isArray(records.failure) ? records.failure : [];
+  const otherRecords = Array.isArray(records.other) ? records.other : [];
+  const activeFailures = failureRecords.filter(record => record && record.recovered === false);
+
+  return {
+    success: successRecords.length,
+    failure: activeFailures.length,
+    other: otherRecords.length,
+    total: successRecords.length + activeFailures.length + otherRecords.length
+  };
+}
+
 /**
  * GET: Get dashboard statistics for a specific device and date
  */
@@ -75,10 +89,8 @@ Router.get('/stats/:deviceId', authenticate, async (req, res) => {
     }
 
     // Calculate summary statistics
-    const successCount = (dashboardStats.stats.records?.success || []).length;
-    const failureCount = (dashboardStats.stats.records?.failure || []).length;
-    const otherCount = (dashboardStats.stats.records?.other || []).length;
-    const totalCount = successCount + failureCount + otherCount;
+    const { success: successCount, failure: failureCount, other: otherCount, total: totalCount } =
+      computeRecordCounts(dashboardStats.stats.records);
 
     // Return date as local YYYY-MM-DD string
     const dateStr = formatLocalDateKey(dashboardStats.stats.date);
@@ -145,24 +157,16 @@ Router.get('/stats', authenticate, async (req, res) => {
     let totalRecords = 0;
 
     const deviceStats = allStats.map(stat => {
-      const successCount = (stat.stats.records?.success || []).length;
-      const failureCount = (stat.stats.records?.failure || []).length;
-      const otherCount = (stat.stats.records?.other || []).length;
-      const totalCount = successCount + failureCount + otherCount;
+      const counts = computeRecordCounts(stat.stats.records);
 
-      totalSuccess += successCount;
-      totalFailure += failureCount;
-      totalOther += otherCount;
-      totalRecords += totalCount;
+      totalSuccess += counts.success;
+      totalFailure += counts.failure;
+      totalOther += counts.other;
+      totalRecords += counts.total;
 
       return {
         deviceId: stat.deviceId,
-        stats: {
-          success: successCount,
-          failure: failureCount,
-          other: otherCount,
-          total: totalCount
-        }
+        stats: counts
       };
     });
 
@@ -267,29 +271,27 @@ Router.get('/chart-data', authenticate, async (req, res) => {
 
     // Aggregate data from stats
     allStats.forEach(stat => {
-      const successCount = (stat.stats.records?.success || []).length;
-      const failureCount = (stat.stats.records?.failure || []).length;
-      const otherCount = (stat.stats.records?.other || []).length;
+      const counts = computeRecordCounts(stat.stats.records);
 
-      totalSuccess += successCount;
-      totalFailure += failureCount;
-      totalOther += otherCount;
+      totalSuccess += counts.success;
+      totalFailure += counts.failure;
+      totalOther += counts.other;
 
       // Add to daily data using local date key
       const dateKey = formatLocalDateKey(stat.stats.date);
       if (dateMap.has(dateKey)) {
         const daily = dateMap.get(dateKey);
-        daily.success += successCount;
-        daily.failure += failureCount;
-        daily.other += otherCount;
-        daily.total += (successCount + failureCount + otherCount);
+        daily.success += counts.success;
+        daily.failure += counts.failure;
+        daily.other += counts.other;
+        daily.total += counts.total;
       } else {
         dateMap.set(dateKey, {
           date: dateKey,
-          success: successCount,
-          failure: failureCount,
-          other: otherCount,
-          total: successCount + failureCount + otherCount
+          success: counts.success,
+          failure: counts.failure,
+          other: counts.other,
+          total: counts.total
         });
       }
     });
@@ -384,7 +386,7 @@ Router.get('/export', authenticate, async (req, res) => {
     const stats = await DashboardStats.find(query).sort({ 'stats.date': 1 });
 
     // Assemble detailed rows
-    const rows = []; // each row: { date, deviceId, outcome, picID, previousVersion, updatedVersion, timestamp }
+    const rows = []; // each row includes recovered state for clarity
     stats.forEach(stat => {
       const dateKey = formatLocalDateKey(stat.stats.date);
       const devId = stat.deviceId;
@@ -398,6 +400,7 @@ Router.get('/export', authenticate, async (req, res) => {
           picID: r.picID || r.picId || r.picId, // defensive names
           previousVersion: r.previousVersion,
           updatedVersion: r.updatedVersion,
+          recovered: typeof r.recovered === 'boolean' ? r.recovered : true,
           timestamp: (r.timestamp instanceof Date) ? r.timestamp.toISOString() : new Date(r.timestamp).toISOString()
         });
       });
@@ -411,6 +414,7 @@ Router.get('/export', authenticate, async (req, res) => {
           picID: r.picID || r.picId,
           previousVersion: r.previousVersion,
           updatedVersion: r.updatedVersion,
+          recovered: typeof r.recovered === 'boolean' ? r.recovered : false,
           timestamp: (r.timestamp instanceof Date) ? r.timestamp.toISOString() : new Date(r.timestamp).toISOString()
         });
       });
@@ -424,6 +428,7 @@ Router.get('/export', authenticate, async (req, res) => {
           picID: r.picID || r.picId,
           previousVersion: r.previousVersion,
           updatedVersion: r.updatedVersion,
+          recovered: typeof r.recovered === 'boolean' ? r.recovered : true,
           timestamp: (r.timestamp instanceof Date) ? r.timestamp.toISOString() : new Date(r.timestamp).toISOString()
         });
       });
@@ -459,7 +464,7 @@ Router.get('/export', authenticate, async (req, res) => {
  */
 Router.get('/time-stats', authenticate, async (req, res) => {
   try {
-    const { projectId, startDate, endDate } = req.query;
+    const { projectId, deviceId, startDate, endDate } = req.query;
 
     // Validate date parameters
     if (!startDate || !endDate) {
@@ -492,8 +497,9 @@ Router.get('/time-stats', authenticate, async (req, res) => {
       'stats.date': { $gte: startLocal, $lte: endLocal }
     };
 
-    // If projectId is provided, filter by devices in that project
-    if (projectId) {
+    if (deviceId) {
+      query.deviceId = deviceId;
+    } else if (projectId) {
       const projectDevices = await Device.find({ project: projectId }).select('deviceId');
       const deviceIds = projectDevices.map(d => d.deviceId);
       query.deviceId = { $in: deviceIds };
@@ -525,29 +531,27 @@ Router.get('/time-stats', authenticate, async (req, res) => {
 
     // Aggregate data from stats
     allStats.forEach(stat => {
-      const successCount = (stat.stats.records?.success || []).length;
-      const failureCount = (stat.stats.records?.failure || []).length;
-      const otherCount = (stat.stats.records?.other || []).length;
+      const counts = computeRecordCounts(stat.stats.records);
 
-      totalSuccess += successCount;
-      totalFailure += failureCount;
-      totalOther += otherCount;
+      totalSuccess += counts.success;
+      totalFailure += counts.failure;
+      totalOther += counts.other;
 
       // Use local date key
       const dateKey = formatLocalDateKey(stat.stats.date);
       if (dateMap.has(dateKey)) {
         const daily = dateMap.get(dateKey);
-        daily.success += successCount;
-        daily.failure += failureCount;
-        daily.other += otherCount;
-        daily.total += (successCount + failureCount + otherCount);
+        daily.success += counts.success;
+        daily.failure += counts.failure;
+        daily.other += counts.other;
+        daily.total += counts.total;
       } else {
         dateMap.set(dateKey, {
           date: dateKey,
-          success: successCount,
-          failure: failureCount,
-          other: otherCount,
-          total: successCount + failureCount + otherCount
+          success: counts.success,
+          failure: counts.failure,
+          other: counts.other,
+          total: counts.total
         });
       }
     });
@@ -680,15 +684,16 @@ Router.get('/summary/:deviceId', authenticate, async (req, res) => {
       .limit(10);
 
     // Calculate daily statistics - return date as local YYYY-MM-DD string
-    const dailyStats = stats.map(stat => ({
-      date: formatLocalDateKey(stat.stats.date),
-      success: (stat.stats.records?.success || []).length,
-      failure: (stat.stats.records?.failure || []).length,
-      other: (stat.stats.records?.other || []).length,
-      total: (stat.stats.records?.success || []).length +
-             (stat.stats.records?.failure || []).length +
-             (stat.stats.records?.other || []).length
-    }));
+    const dailyStats = stats.map(stat => {
+      const counts = computeRecordCounts(stat.stats.records);
+      return {
+        date: formatLocalDateKey(stat.stats.date),
+        success: counts.success,
+        failure: counts.failure,
+        other: counts.other,
+        total: counts.total
+      };
+    });
 
     res.status(200).json({
       success: true,

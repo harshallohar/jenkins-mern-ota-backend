@@ -21,6 +21,14 @@ const OTAUpdateSchema = new mongoose.Schema({
     type: String, 
     required: true 
   },
+  reprogramming: {
+    type: Boolean,
+    default: false
+  },
+  recovered: {
+    type: Boolean,
+    default: true
+  },
   statusMessage: { 
     type: String 
   },

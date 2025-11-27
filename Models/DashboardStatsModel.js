@@ -3,8 +3,13 @@ const mongoose = require('mongoose');
 const RecordSchema = new mongoose.Schema({
   picID: { type: String, required: true },
   deviceId: { type: String, required: true },
+  status: { type: String },
+  statusMessage: { type: String },
+  badge: { type: String, enum: ['success', 'failure', 'other'], default: 'other' },
   previousVersion: { type: String, required: true },
   updatedVersion: { type: String, required: true },
+  recovered: { type: Boolean, default: true },
+  reprogramming: { type: Boolean, default: false },
   timestamp: { type: Date, required: true },
   date: { type: Date, default: Date.now }
 });

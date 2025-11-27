@@ -5,6 +5,20 @@ const Device = require('../Models/DeviceModel');
 const { authenticate } = require('../Middleware/auth');
 const ActivityLogger = require('../Services/ActivityLogger');
 
+const findDuplicateStatusCode = (codes = []) => {
+  const seen = new Set();
+  for (const code of codes) {
+    if (!code || code.code === undefined || code.code === null) continue;
+    const normalized = code.code.toString().trim();
+    if (normalized === '') continue;
+    if (seen.has(normalized)) {
+      return normalized;
+    }
+    seen.add(normalized);
+  }
+  return null;
+};
+
 // Get all status management entries
 router.get('/', authenticate, async (req, res) => {
   try {
@@ -67,6 +81,15 @@ router.post('/', authenticate, async (req, res) => {
       }
     }
     
+    if (!isBasedOnOtherDevice) {
+      const duplicateCode = findDuplicateStatusCode(statusCodes);
+      if (duplicateCode !== null) {
+        return res.status(400).json({
+          message: `Status code ${duplicateCode} is already defined for this device`
+        });
+      }
+    }
+
     const statusManagement = new StatusManagement({
       deviceId,
       deviceName,
@@ -119,6 +142,15 @@ router.put('/:id', authenticate, async (req, res) => {
       }
     }
     
+    if (!isBasedOnOtherDevice && Array.isArray(statusCodes)) {
+      const duplicateCode = findDuplicateStatusCode(statusCodes);
+      if (duplicateCode !== null) {
+        return res.status(400).json({
+          message: `Status code ${duplicateCode} is already defined for this device`
+        });
+      }
+    }
+
     // Update fields
     if (deviceName) statusManagement.deviceName = deviceName;
     if (statusCodes) statusManagement.statusCodes = statusCodes;

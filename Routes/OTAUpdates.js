@@ -5,13 +5,56 @@ const StatusManagement = require('../Models/StatusManagementModel');
 const DashboardStats = require('../Models/DashboardStatsModel');
 const Device = require('../Models/DeviceModel'); // adjust path if needed
 
-// Helper function to determine update type based on versions
-const determineUpdateType = (previousVersion, updatedVersion) => {
-  const prev = parseFloat(previousVersion);
-  const updated = parseFloat(updatedVersion);
-  if (updatedVersion === "0.0") return 'failure';
-  if (!isNaN(prev) && !isNaN(updated) && prev < updated) return 'success';
-  return 'other';
+// Helper: safely parse truthy/falsey payloads into booleans
+const parseBoolean = (value) => {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true') return true;
+    if (normalized === 'false') return false;
+    if (normalized === '1') return true;
+    if (normalized === '0') return false;
+  }
+  if (typeof value === 'number') {
+    if (value === 1) return true;
+    if (value === 0) return false;
+  }
+  return Boolean(value);
+};
+
+const normalizeVersionParts = (version) => {
+  if (typeof version !== 'string') {
+    if (version === undefined || version === null) {
+      return [0];
+    }
+    version = String(version);
+  }
+  if (version.trim() === '') return [0];
+  return version
+    .split('.')
+    .map(part => {
+      const num = parseInt(part, 10);
+      return isNaN(num) ? 0 : num;
+    });
+};
+
+// Returns:
+//  -1 => previousVersion < updatedVersion
+//   0 => equal
+//   1 => previousVersion > updatedVersion
+const compareVersions = (previousVersion, updatedVersion) => {
+  const prevParts = normalizeVersionParts(previousVersion);
+  const updatedParts = normalizeVersionParts(updatedVersion);
+  const maxLength = Math.max(prevParts.length, updatedParts.length);
+
+  for (let i = 0; i < maxLength; i++) {
+    const prev = prevParts[i] ?? 0;
+    const updated = updatedParts[i] ?? 0;
+    if (prev > updated) return 1;
+    if (prev < updated) return -1;
+  }
+
+  return 0;
 };
 
 // Helper function to get today's date at midnight in local timezone
@@ -82,14 +125,41 @@ const findOrCreateDashboardStats = async (deviceId, date) => {
 // POST: Receive ESP32 OTA update report
 Router.post('/report', async (req, res) => {
   try {
-    const { pic_id, deviceId, status, previousVersion, updatedVersion } = req.body;
+    const {
+      pic_id,
+      deviceId,
+      status,
+      previousVersion,
+      updatedVersion,
+      reprogramming: reprogrammingInput
+    } = req.body;
 
-    if (!pic_id || !deviceId || !status || !previousVersion || !updatedVersion) {
+    const requiredFieldMap = {
+      pic_id,
+      deviceId,
+      status,
+      previousVersion,
+      updatedVersion
+    };
+
+    const missingFields = Object.entries(requiredFieldMap)
+      .filter(([, value]) => value === undefined || value === null || String(value).trim() === '')
+      .map(([key]) => key);
+
+    if (reprogrammingInput === undefined || reprogrammingInput === null || String(reprogrammingInput).trim() === '') {
+      missingFields.push('reprogramming');
+    }
+
+    if (missingFields.length > 0) {
       return res.status(400).json({
         success: false,
-        message: 'Missing required fields: pic_id, deviceId, status, previousVersion, updatedVersion'
+        message: `Missing required fields: ${missingFields.join(', ')}`
       });
     }
+
+    const sanitizedPreviousVersion = String(previousVersion).trim();
+    const sanitizedUpdatedVersion = String(updatedVersion).trim();
+    const isReprogramming = parseBoolean(reprogrammingInput);
 
     const statusManagement = await StatusManagement.findOne({ deviceId: deviceId });
     if (!statusManagement) {
@@ -99,7 +169,8 @@ Router.post('/report', async (req, res) => {
       });
     }
 
-    const statusCode = statusManagement.statusCodes.find(sc => sc.code.toString() === status);
+    const statusCodes = Array.isArray(statusManagement.statusCodes) ? statusManagement.statusCodes : [];
+    const statusCode = statusCodes.find(sc => sc.code.toString() === status.toString());
     if (!statusCode) {
       return res.status(404).json({
         success: false,
@@ -107,78 +178,117 @@ Router.post('/report', async (req, res) => {
       });
     }
 
-    const updateType = determineUpdateType(previousVersion, updatedVersion);
+    const baseBadge = statusCode.badge || 'other';
+    let finalBadge = baseBadge;
+    const versionComparison = compareVersions(sanitizedPreviousVersion, sanitizedUpdatedVersion);
+    const isVersionUpgrade = versionComparison === -1;
+    const isVersionEqual = versionComparison === 0;
+    const shouldHandleReprogrammingSuccess = isReprogramming && baseBadge === 'success';
+    const alreadyUpdatedCase = !isReprogramming && isVersionEqual && baseBadge === 'other';
+    const lowerToUpper = !isReprogramming && isVersionUpgrade;
+
+    if (shouldHandleReprogrammingSuccess || alreadyUpdatedCase) {
+      finalBadge = 'other';
+    }
+
     const timestamp = new Date();
 
     const otaUpdate = new OTAUpdate({
       pic_id,
       deviceId,
       status,
-      previousVersion,
-      updatedVersion,
+      previousVersion: sanitizedPreviousVersion,
+      updatedVersion: sanitizedUpdatedVersion,
       statusMessage: statusCode.message,
-      badge: statusCode.badge,
+      badge: finalBadge,
       color: statusCode.color,
+      reprogramming: isReprogramming,
+      recovered: finalBadge === 'failure' ? false : true,
       timestamp: timestamp
     });
 
     await otaUpdate.save();
 
-    // Update dashboard stats
-    const today = getTodayDate();
-    const dashboardStats = await findOrCreateDashboardStats(deviceId, today);
+    let dashboardStats = null;
+    let dashboardModified = false;
+    const needsDashboardUpdate = shouldHandleReprogrammingSuccess || alreadyUpdatedCase || lowerToUpper;
 
-    const record = {
-      picID: pic_id,
-      deviceId: deviceId,
-      previousVersion: previousVersion,
-      updatedVersion: updatedVersion,
-      timestamp: timestamp,
-      date: new Date()
-    };
+    if (needsDashboardUpdate) {
+      const today = getTodayDate();
+      dashboardStats = await findOrCreateDashboardStats(deviceId, today);
 
-    if (updateType === 'success') {
-      if (Array.isArray(dashboardStats.stats.records.failure)) {
-        dashboardStats.stats.records.failure = dashboardStats.stats.records.failure.filter(r => r.picID !== pic_id);
-      } else {
-        dashboardStats.stats.records.failure = [];
-      }
-      if (Array.isArray(dashboardStats.stats.records.success)) {
-        dashboardStats.stats.records.success.push(record);
-      } else {
-        dashboardStats.stats.records.success = [record];
-      }
-    } else if (updateType === 'failure') {
-      let existingFailure = false;
-      if (Array.isArray(dashboardStats.stats.records.failure)) {
-        existingFailure = dashboardStats.stats.records.failure.find(
-          r => r.picID === pic_id &&
-               r.previousVersion === previousVersion &&
-               r.updatedVersion === updatedVersion &&
-               r.timestamp && r.timestamp.getTime && (new Date(r.timestamp)).getTime() === timestamp.getTime()
-        );
-      }
-      if (!existingFailure) {
-        if (Array.isArray(dashboardStats.stats.records.failure)) {
-          dashboardStats.stats.records.failure.push(record);
+      // Ensure record buckets exist
+      const records = dashboardStats.stats.records || {};
+      dashboardStats.stats.records = records;
+      records.success = Array.isArray(records.success) ? records.success : [];
+      records.failure = Array.isArray(records.failure) ? records.failure : [];
+      records.other = Array.isArray(records.other) ? records.other : [];
+
+      const baseRecord = {
+        picID: pic_id,
+        deviceId: deviceId,
+        status: status,
+        statusMessage: statusCode.message,
+        badge: finalBadge,
+        previousVersion: sanitizedPreviousVersion,
+        updatedVersion: sanitizedUpdatedVersion,
+        reprogramming: isReprogramming,
+        timestamp: timestamp,
+        date: dashboardStats.stats.date || today
+      };
+
+      const addRecord = (bucket, overrides = {}) => {
+        const record = {
+          ...baseRecord,
+          recovered: bucket === 'failure' ? false : true,
+          ...overrides
+        };
+        records[bucket].push(record);
+        dashboardStats.markModified(`stats.records.${bucket}`);
+        dashboardModified = true;
+        return record;
+      };
+
+      const findUnrecoveredFailure = () => {
+        return records.failure.find(r => r.picID === pic_id && r.deviceId === deviceId && r.recovered === false);
+      };
+
+      if (shouldHandleReprogrammingSuccess) {
+        addRecord('other');
+      } else if (alreadyUpdatedCase) {
+        addRecord('other');
+      } else if (lowerToUpper) {
+        if (finalBadge === 'success') {
+          const unrecoveredFailure = findUnrecoveredFailure();
+          if (unrecoveredFailure) {
+            unrecoveredFailure.recovered = true;
+            dashboardStats.markModified('stats.records.failure');
+            dashboardModified = true;
+            await OTAUpdate.updateMany(
+              { pic_id, deviceId, badge: 'failure', recovered: false },
+              { $set: { recovered: true } }
+            );
+          }
+          addRecord('success');
+        } else if (finalBadge === 'failure') {
+          const existingFailure = findUnrecoveredFailure();
+          if (!existingFailure) {
+            addRecord('failure', { recovered: false });
+          }
         } else {
-          dashboardStats.stats.records.failure = [record];
+          addRecord('other');
         }
-      }
-    } else {
-      if (Array.isArray(dashboardStats.stats.records.other)) {
-        dashboardStats.stats.records.other.push(record);
-      } else {
-        dashboardStats.stats.records.other = [record];
       }
     }
 
-    try {
-      await dashboardStats.save();
-      console.log('✅ Dashboard stats saved successfully');
-    } catch (saveError) {
-      console.error('❌ Error saving dashboard stats:', saveError);
-      throw new Error(`Failed to save dashboard stats: ${saveError.message}`);
+    if (dashboardStats && dashboardModified) {
+      try {
+        await dashboardStats.save();
+        console.log('✅ Dashboard stats saved successfully');
+      } catch (saveError) {
+        console.error('❌ Error saving dashboard stats:', saveError);
+        throw new Error(`Failed to save dashboard stats: ${saveError.message}`);
+      }
     }
 
     res.status(200).json({
@@ -187,7 +297,9 @@ Router.post('/report', async (req, res) => {
       data: {
         otaUpdate: otaUpdate,
         dashboardStats: dashboardStats,
-        updateType: updateType,
+        updateType: finalBadge,
+        badge: finalBadge,
+        reprogramming: isReprogramming,
         timestamp: timestamp
       }
     });
