@@ -1,7 +1,9 @@
 version: '3'
+
 services:
   backend:
     build: .
+    container_name: ota-backend-backend-1
     ports:
       - "5000:5000"
     env_file:
@@ -9,15 +11,24 @@ services:
     restart: always
     depends_on:
       - mongo
+    networks:
+      - ota-network
 
   mongo:
     image: mongo
+    container_name: ota-backend-mongo-1
     ports:
       - "27017:27017"
-    restart: always
     volumes:
       - apt_ota_system_mongo-data:/data/db
+    restart: always
+    networks:
+      - ota-network
 
 volumes:
   apt_ota_system_mongo-data:
+    external: true
+
+networks:
+  ota-network:
     external: true
