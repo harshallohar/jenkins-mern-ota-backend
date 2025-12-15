@@ -178,10 +178,15 @@ Router.get("/check-version", async (req, res) => {
 
 // Get All Firmwares Details API
 
+
 Router.get('/firmwares-details',async (req,res)=>{
 
     try{
-        const firmwares = await FirmwareModel.find().sort({uploadedDate: -1});
+        // Return only metadata to keep payload light; binary is fetched via download endpoints
+        const firmwares = await FirmwareModel.find(
+          {},
+          "version description esp_id uploadedDate fileSize fileName originalFileName fileMimeType"
+        ).sort({uploadedDate: -1});
         res.status(200).json(firmwares);
     }catch(err){
         res.status(500).json({
